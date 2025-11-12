@@ -3,7 +3,7 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 
 class RopeEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048, device = 'cpu'):
@@ -33,34 +33,30 @@ class RopeEmbedding(nn.Module):
         k_rot = (k * cos_emb) + (kJ * sin_emb)
         return q_rot, k_rot
     
-         
+
 class MultiHeadAttention(nn.Module):
-    def __init__(self, model_dim, n_heads, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
         self.dk = model_dim // n_heads
         self.n_heads = n_heads
-        self.W_q = nn.Linear(self.d, self.d, bias=False)
-        self.W_k = nn.Linear(self.d, self.d, bias=False)
-        self.W_v = nn.Linear(self.d, self.d, bias=False)
-        self.W_o = nn.Linear(self.d, self.d, bias=False)
-
-        if dropout_prob > 0:
-            self.attn_dropout = nn.Dropout(p=dropout_prob)
-            self.out_dropout = nn.Dropout(p=dropout_prob)
-        else:
-            self.attn_dropout = None
-            self.out_dropout = None
+        self.n_kv_heads = n_kv_heads or n_heads
+        self.dropout_prob = dropout_prob
         self.rope_embedder = rope_embedder
         self.qk_norm = qk_norm
-        self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)))) # The normalization constant in QK-Norm is active.
+        self.causal = causal
+        self.W_q = nn.Linear(self.d, self.d, bias=False)
+        self.W_k = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
+        self.W_v = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
+        self.W_o = nn.Linear(self.d, self.d, bias=False)
+        self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)).to(torch.float32))) # The normalization constant in QK-Norm is active.
 
     def forward(self,
                  q: torch.Tensor,
                  k: torch.Tensor,
                  v: torch.Tensor,
-                 mask=None)-> Tuple[torch.Tensor, torch.Tensor]:
+                 mask: Optional[torch.Tensor] = None)-> Tuple[torch.Tensor, torch.Tensor]:
         """
         Multi-head (self/cross) attention forward pass.
         Args:
@@ -73,14 +69,16 @@ class MultiHeadAttention(nn.Module):
             y: (B, T_q, D) attention output
             A: (B, n_heads, T_q, T_k) attention weights
         """
+        if mask is not None and mask.dtype not in (torch.bool, torch.float32, torch.float16, torch.bfloat16):
+            mask = mask.to(torch.bool)
         B, T_q, _ = q.shape
         B, T_k, _ = k.shape
         Q = self.W_q(q) # BxTx3d
         K = self.W_k(k) # BxTx3d
         V = self.W_v(v) # BxTx3d
         Q = Q.view(B, T_q, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
-        K = K.view(B, T_k, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
-        V = V.view(B, T_k, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
+        K = K.view(B, T_k, self.n_kv_heads, self.dk).transpose(1,2) # Bxn_kvxT_kxd
+        V = V.view(B, T_k, self.n_kv_heads, self.dk).transpose(1,2) # Bxn_kvxT_kxd
         # Normalize the features per head if qk_norm is active
         if self.qk_norm:
             Q = F.normalize(Q, dim=-1)
@@ -88,25 +86,48 @@ class MultiHeadAttention(nn.Module):
 
         if self.rope_embedder is not None:
             Q, K = self.rope_embedder(Q, K)
-        A = Q@K.transpose(-1, -2)             #BxhxTxT 
+            
+        Y = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask=mask, 
+            dropout_p=self.dropout_prob if self.training else 0.0,
+            is_causal=self.causal,
+            scale = self.g,
+            enable_gqa= False if self.n_kv_heads == self.n_heads else True,
+        )  # [B, n_heads, Tq, dk]
+        Y = Y.transpose(1, 2).contiguous().view(B, T_q, self.d)
+        Y = self.W_o(Y)
+        return Y
+    
 
-        if self.qk_norm:
-            A = A/(self.dk**0.5)
-        else:
-            A = A*self.g
-        
-        if mask is not None: # Mask should have the same shape as the attention map
-            # ensure mask can broadcast to (B, n_heads, T, T)
-            if mask.dim() == 3:
-                mask = mask.unsqueeze(1)
-            A = A.masked_fill(mask==0, float('-inf'))
-            A = torch.clamp(A, min=-1e4, max=1e4)
-        A = F.softmax(A, dim=-1) #BxhxTxT Softmax applied along the attention matrix rows for each head independently
-        if self.attn_dropout is not None:
-            A = self.attn_dropout(A)
-        Y = torch.matmul(A, V) # BxhxTxdk
-        Y = Y.transpose(1,2).contiguous() # BxTxhxdk
-        Y = self.W_o(Y.view(B, T_q, self.d))
-        if self.out_dropout is not None:
-            Y = self.out_dropout(Y)
-        return Y, A 
+# class AxialAttentionBlock(nn.Module):
+#     def __init__(self, model_dim, n_heads, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+#         super().__init__()
+#         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
+#         self.d = model_dim
+#         self.n_heads = n_heads
+#         self.dropout_prob = dropout_prob
+#         self.qk_norm = qk_norm
+#         self.max_seq_len = max_seq_len
+#         self.rope_embedder = rope_embedder
+#         self.mha = MultiHeadAttention(model_dim=model_dim, 
+#                                       n_heads=n_heads, 
+#                                       dropout_prob=dropout_prob,
+#                                       qk_norm=qk_norm, 
+#                                       max_seq_len=max_seq_len, 
+#                                       rope_embedder=rope_embedder)
+
+#     def forward(self, q, k, v, dim, mask):
+#         """
+#         Axial attention along dim axis.
+#         Args:
+#             q: (B, T_q, D) queries
+#             k: (B, T_k, D) keys
+#             v: (B, T_k, D) values
+#             dim: int dimension along which the attention should be applied
+#             mask: (B, 1, T_q, T_k) or broadcastable mask
+#         Returns:
+#             y: (B, T_q, D) attention output
+#             A: (B, n_heads, T_q, T_k) attention weights
+#         """
+
