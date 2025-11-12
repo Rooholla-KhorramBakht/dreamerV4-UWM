@@ -1,4 +1,5 @@
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ class RopeEmbedding(nn.Module):
     
          
 class MultiHeadAttention(nn.Module):
-    def __init__(self, model_dim, n_heads, dropout_prob = 0, rope = None):
+    def __init__(self, model_dim, n_heads, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
@@ -51,7 +52,9 @@ class MultiHeadAttention(nn.Module):
         else:
             self.attn_dropout = None
             self.out_dropout = None
-        self.rope = rope
+        self.rope_embedder = rope_embedder
+        self.qk_norm = qk_norm
+        self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)))) # The normalization constant in QK-Norm is active.
 
     def forward(self,
                  q: torch.Tensor,
@@ -78,10 +81,20 @@ class MultiHeadAttention(nn.Module):
         Q = Q.view(B, T_q, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
         K = K.view(B, T_k, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
         V = V.view(B, T_k, self.n_heads, self.dk).transpose(1,2) # BxhxTxd
-        if self.rope is not None:
-            Q, K = self.rope(Q, K)
+        # Normalize the features per head if qk_norm is active
+        if self.qk_norm:
+            Q = F.normalize(Q, dim=-1)
+            K = F.normalize(K, dim=-1)
+
+        if self.rope_embedder is not None:
+            Q, K = self.rope_embedder(Q, K)
         A = Q@K.transpose(-1, -2)             #BxhxTxT 
-        A = A/(self.dk**0.5)
+
+        if self.qk_norm:
+            A = A/(self.dk**0.5)
+        else:
+            A = A*self.g
+        
         if mask is not None: # Mask should have the same shape as the attention map
             # ensure mask can broadcast to (B, n_heads, T, T)
             if mask.dim() == 3:
