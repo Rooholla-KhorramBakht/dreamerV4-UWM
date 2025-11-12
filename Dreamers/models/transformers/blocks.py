@@ -34,7 +34,7 @@ class RopeEmbedding(nn.Module):
         return q_rot, k_rot
     
 
-class MultiHeadAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
@@ -50,7 +50,7 @@ class MultiHeadAttention(nn.Module):
         self.W_k = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
         self.W_v = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
         self.W_o = nn.Linear(self.d, self.d, bias=False)
-        self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)).to(torch.float32))) # The normalization constant in QK-Norm is active.
+        self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)), dtype=torch.float32)) # The normalization constant in QK-Norm is active.
 
     def forward(self,
                  q: torch.Tensor,
@@ -86,7 +86,7 @@ class MultiHeadAttention(nn.Module):
 
         if self.rope_embedder is not None:
             Q, K = self.rope_embedder(Q, K)
-            
+
         Y = F.scaled_dot_product_attention(
             Q, K, V,
             attn_mask=mask, 
