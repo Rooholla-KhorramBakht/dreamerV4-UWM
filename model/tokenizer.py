@@ -10,7 +10,7 @@ from dataclasses import dataclass
 class CausalTokenizerConfig:
     num_modality_tokens: int
     num_latent_tokens: int
-    max_context_lenghth: int
+    max_context_length: int
     model_dim: int
     latent_dim: int
     enc_num_layers: int 
@@ -28,7 +28,7 @@ class CausalTokenizerEncoder(nn.Module):
         model_dim = cfg.model_dim
         num_layers = cfg.enc_num_layers
         self.num_spatial_tokens = cfg.num_modality_tokens + cfg.num_latent_tokens 
-        self.max_seq_len = max(cfg.max_context_lenghth, self.num_spatial_tokens)
+        self.max_seq_len = max(cfg.max_context_length, self.num_spatial_tokens)
         self.layers = nn.ModuleList( [EfficientTransformerBlock(model_dim=model_dim,
                                                                 n_heads=cfg.n_heads,
                                                                 n_kv_heads= cfg.n_kv_heads,
@@ -66,7 +66,7 @@ class CausalTokenizerDecoder(nn.Module):
         model_dim = cfg.model_dim
         num_layers = cfg.dec_num_layers
         self.num_spatial_tokens = cfg.num_modality_tokens + cfg.num_latent_tokens 
-        self.max_seq_len = max(cfg.max_context_lenghth, self.num_spatial_tokens)
+        self.max_seq_len = max(cfg.max_context_length, self.num_spatial_tokens)
         self.layers = nn.ModuleList( [EfficientTransformerBlock(model_dim=model_dim,
                                                                 n_heads=cfg.n_heads,
                                                                 n_kv_heads= cfg.n_kv_heads,

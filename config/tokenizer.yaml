@@ -1,0 +1,34 @@
+defaults:
+ - dataset: pushT
+
+tokenizer:
+  num_modality_tokens: 256 # Number of tokens for the image or other modalities
+  num_latent_tokens: 32    # The number of latent tokens per frame
+  max_context_length: 192  # The maximum temporal horizon of the tokenizer
+  model_dim: 768          # The dimension of the transformer latents
+  latent_dim: 256          # The dimention of the encoder output latents (z)
+  enc_num_layers: 4        # Causal tokenizer encoder depth
+  dec_num_layers: 4        # Causal tokenizer decoder depth
+  n_heads: 8
+  n_kv_heads: 4
+  dropout_prob: 0.1
+  qk_norm: true
+  patch_size: 14
+
+train:
+  output_dir: checkpoints
+  batch_size: 2
+  accum_grad_steps: 4
+  lr: 1e-4
+  num_workers: 32
+
+  evaluate_every: 5000
+  save_every: 20000
+  plots_every: 20000
+  output_dir: "outputs"
+
+
+wandb:
+  enabled: false # Enable or disable wandb logging
+  project: "dreamerv4-tokenizer" # Replace with your wandb project name
+
