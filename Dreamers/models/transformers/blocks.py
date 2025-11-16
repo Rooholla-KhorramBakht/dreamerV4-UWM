@@ -162,7 +162,7 @@ class AxialAttention(nn.Module):
         Y = self.attn(reordered_q, reordered_k, reordered_v, mask)
         Y = Y.view((dims_q[:dim]+dims_q[dim+1:-1]+[dims_q[dim], D])).transpose(dim, -2).contiguous()
         return Y
-    
+
 class AxialSelfAttentionBlock(nn.Module):
     """
     Axial Self-Attention block with residual connection and RMSNorm.
@@ -193,6 +193,7 @@ class AxialSelfAttentionBlock(nn.Module):
         )
         self.Dense = nn.Linear(model_dim, model_dim)
         self.rmsnorm = nn.RMSNorm(model_dim)
+    
     def forward(self,
                 x: torch.Tensor, 
                 dim: int, 
@@ -206,6 +207,56 @@ class AxialSelfAttentionBlock(nn.Module):
         attn_out = self.attnk(x_norm, x_norm, x_norm, dim, mask)
         out = self.Dense(attn_out) + x
         return out
+    
+class FeedForwardBlock(nn.Module):
+    """
+    Feed-Forward block with residual connection and RMSNorm.
+    Uses SwiGLU nonlinearity.
+    """
+    def __init__(self, model_dim):
+        super().__init__()
+        self.model_dim = model_dim
+        self.Dense1 = nn.Linear(model_dim, model_dim*4)
+        self.Dense2 = nn.Linear(model_dim*4, model_dim)
+        self.rmsnorm = nn.RMSNorm(model_dim)
+        self.nonlinearity = SwiGLU(model_dim*4, model_dim*4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.rmsnorm(x)
+        x = self.Dense2(self.nonlinearity(self.Dense1(x))) + x
+        return x
+    
+class AxialEncoderBlock(nn.Module):
+    """
+    Axial Transformer Encoder block with Axial Self-Attention and Feed-Forward Network.
+    Operates along a chosen 1D axis of a N-D tensor (B, dim 1, ..., dim N, D).
+    """
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
+        super().__init__()
+        self.model_dim = model_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.causal = causal
+        self.dropout_prob = dropout_prob
+        self.qk_norm = qk_norm
+        self.max_seq_len = max_seq_len
+        self.rope_embedder = rope_embedder
+        self.attn_block = AxialSelfAttentionBlock(
+            model_dim=model_dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            causal=causal,
+            dropout_prob=dropout_prob,
+            qk_norm=qk_norm,
+            max_seq_len=max_seq_len,
+            rope_embedder=rope_embedder
+        )
+        self.ffn_block = FeedForwardBlock(model_dim=model_dim)
+    
+    def forward(self, x: torch.Tensor, dim: int, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.attn_block(x, dim, mask)
+        x = self.ffn_block(x)
+        return x    
     
 class AxialCrossAttentionBlock(nn.Module):
     """
@@ -255,53 +306,3 @@ class AxialCrossAttentionBlock(nn.Module):
         attn_out = self.attnk(x, context, context, dim, mask)
         out = self.Dense(attn_out) + x
         return out
-
-class FeedForwardBlock(nn.Module):
-    """
-    Feed-Forward block with residual connection and RMSNorm.
-    Uses SwiGLU nonlinearity.
-    """
-    def __init__(self, model_dim):
-        super().__init__()
-        self.model_dim = model_dim
-        self.Dense1 = nn.Linear(model_dim, model_dim*4)
-        self.Dense2 = nn.Linear(model_dim*4, model_dim)
-        self.rmsnorm = nn.RMSNorm(model_dim)
-        self.nonlinearity = SwiGLU(model_dim*4, model_dim*4)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.rmsnorm(x)
-        x = self.Dense2(self.nonlinearity(self.Dense1(x))) + x
-        return x
-    
-class AxialTransformerEncoderBlock(nn.Module):
-    """
-    Axial Transformer Encoder block with Axial Self-Attention and Feed-Forward Network.
-    Operates along a chosen 1D axis of a N-D tensor (B, dim 1, ..., dim N, D).
-    """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
-        super().__init__()
-        self.model_dim = model_dim
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.causal = causal
-        self.dropout_prob = dropout_prob
-        self.qk_norm = qk_norm
-        self.max_seq_len = max_seq_len
-        self.rope_embedder = rope_embedder
-        self.attn_block = AxialSelfAttentionBlock(
-            model_dim=model_dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            causal=causal,
-            dropout_prob=dropout_prob,
-            qk_norm=qk_norm,
-            max_seq_len=max_seq_len,
-            rope_embedder=rope_embedder
-        )
-        self.ffn_block = FeedForwardBlock(model_dim=model_dim)
-    
-    def forward(self, x: torch.Tensor, dim: int, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.attn_block(x, dim, mask)
-        x = self.ffn_block(x)
-        return x    
