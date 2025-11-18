@@ -1,5 +1,6 @@
 
 import time
+from PIL import Image
 import hydra
 from tqdm import tqdm
 from omegaconf import DictConfig, OmegaConf
@@ -18,6 +19,50 @@ from model.utils import TokenMasker
 import torch.optim as optim
 import lpips
 from pathlib import Path
+import wandb
+
+def save_checkpoint(model, optimizer, step, epoch, cfg, scaler=None, scheduler=None):
+    ckpt_dir = Path(cfg.output_dir) / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"checkpoint_step_{step:07d}.pt"
+
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "epoch": epoch,
+        "cfg": OmegaConf.to_container(cfg, resolve=True),  # snapshot config
+    }
+
+    if scaler is not None:
+        checkpoint["scaler"] = scaler.state_dict()
+
+    if scheduler is not None:
+        checkpoint["scheduler"] = scheduler.state_dict()
+
+    torch.save(checkpoint, ckpt_path)
+    print(f"🔒 Checkpoint saved at: {str(ckpt_path)}")
+
+
+def load_checkpoint(ckpt_path, model, optimizer=None, scaler=None, scheduler=None):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    model.load_state_dict(ckpt["model"])
+
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    if scaler is not None and "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+
+    if scheduler is not None and "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+
+    step = ckpt.get("step", 0)
+    epoch = ckpt.get("epoch", 0)
+
+    print(f"🔄 Loaded checkpoint from {ckpt_path} at step={step}, epoch={epoch}")
+    return step, epoch
 
 class ModelWrapper(nn.Module):
     def __init__(self, cfg:DictConfig):
@@ -40,6 +85,20 @@ class ModelWrapper(nn.Module):
 
 @hydra.main(config_path="config", config_name="tokenizer.yaml")
 def main(cfg: DictConfig):
+    # --------------------------------------------------------------------
+    #  W&B SETUP
+    # --------------------------------------------------------------------
+    if cfg.wandb.enable:
+        if cfg.wandb.api_key:
+            wandb.login(key=cfg.wandb.api_key)
+        else:
+            wandb.login()   # rely on env var or already logged-in session
+        wandb_config = OmegaConf.to_container(cfg, resolve=True)
+        wandb.init(
+            project=cfg.wandb.project,
+            entity="rk4342",
+            config=wandb_config
+        )
     # Torch configs
     if cfg.train.enable_fast_matmul:
         torch.set_float32_matmul_precision('high')
@@ -105,12 +164,12 @@ def main(cfg: DictConfig):
     mse_loss_fn = nn.MSELoss()
     # lpips_loss_fn = lpips.LPIPS(net='vgg').eval().to(device)   # perceptual loss
     optimizer = optim.Adam(model.parameters(), lr=cfg.train.lr)
-
     step = 0
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
             step += 1
-            imgs = batch['observation.image'].to(torch.float32).to(device)
+            ctx_len = torch.randint(1, cfg.tokenizer.max_context_length,(1,)).item()
+            imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
             if cfg.augmentation.enable:
                 B, T, C, H, W = imgs.shape
                 imgs = imgs.view(B*T, C, H, W).contiguous().to(device)      # flatten time
@@ -132,8 +191,17 @@ def main(cfg: DictConfig):
                 total_loss = mse
                 total_loss.backward()
             optimizer.step()
-            if step % cfg.print_every:
+            if step % cfg.print_every==0:
                 print(f"MSE so far: {total_loss.item()}")
+
+            # ------------------------------------------------------------------
+            #  LOG LOSS TO WANDB
+            # ------------------------------------------------------------------
+            if cfg.wandb.enable and (step % cfg.train.log_every == 0):
+                wandb.log({
+                    "train/mse_loss": mse.item(),
+                }, step=step)
+
 
             if step % cfg.plot_every == 0:
                 # ------------------------------------------------------------------
@@ -167,29 +235,35 @@ def main(cfg: DictConfig):
                     tiled = torch.cat(rows, dim=1)   # stack vertically
 
                     # --------------------------------------------------------------
-                    #  Convert to CPU uint8 image for saving/logging
+                    #  Convert to PIL Image
                     # --------------------------------------------------------------
                     tiled_np = (tiled.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
 
-                    # Resize to something reasonable for W&B (max 512px)
-                    import cv2
-                    max_dim = 512
-                    h, w, _ = tiled_np.shape
-                    scale = min(max_dim / max(h, w), 1.0)
-                    resized_np = cv2.resize(tiled_np, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                    tiled_img = Image.fromarray(tiled_np)
 
-                    # Save file
-                    output_dir = Path(cfg.output_dir)
+                    # --------------------------------------------------------------
+                    #  Resize to a W&B-friendly size (max 512px)
+                    # --------------------------------------------------------------
+                    max_dim = 4096
+                    w, h = tiled_img.size
+                    scale = min(max_dim / max(w, h), 1.0)
+                    new_w, new_h = int(w * scale), int(h * scale)
+                    tiled_img_resized = tiled_img.resize((new_w, new_h), Image.BILINEAR)
+
+                    # --------------------------------------------------------------
+                    #  Save image locally
+                    # --------------------------------------------------------------
+                    output_dir = Path(cfg.output_dir) / "plots"
                     output_dir.mkdir(parents=True, exist_ok=True)
                     file_path = output_dir / f"step_{step:06d}.png"
-                    cv2.imwrite(str(file_path), cv2.cvtColor(resized_np, cv2.COLOR_RGB2BGR))
+                    tiled_img_resized.save(file_path)
 
                     # --------------------------------------------------------------
                     #  Optional W&B logging
                     # --------------------------------------------------------------
                     if cfg.wandb.enable:
-                        import wandb
-                        wandb.log({"reconstruction_preview": wandb.Image(resized_np)}, step=step)
+                        wandb.log({"reconstruction_preview": wandb.Image(tiled_img_resized)}, step=step)
+        save_checkpoint(model, optimizer, step, epoch, cfg)
 
     model.train()
 if __name__ == '__main__':
