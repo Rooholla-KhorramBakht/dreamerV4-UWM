@@ -78,35 +78,35 @@ def save_checkpoint(
 ):
     """
     Save a FULL checkpoint (unsharded enc/dec) on rank 0.
-    Assumes all ranks call this, but only rank 0 writes to disk.
+    ALL RANKS must call this function for FSDP collectives to work.
     """
-    if rank != 0:
-        return
-
-    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-
     # Gather full (unsharded) state dicts on CPU
-    full_cfg = FullStateDictConfig(rank0_only=True, cpu_offload=True)
+    # ALL RANKS must participate in this, even though only rank 0 gets the result
+    full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
 
     with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
-        enc_state = enc.state_dict()
+        enc_state = enc.state_dict()  # All ranks participate in gather
     with FSDP.state_dict_type(dec, StateDictType.FULL_STATE_DICT, full_cfg):
-        dec_state = dec.state_dict()
+        dec_state = dec.state_dict()  # All ranks participate in gather
 
-    ckpt = {
-        "epoch": epoch,
-        "global_update": global_update,
-        "enc": enc_state,
-        "dec": dec_state,
-        "optim": optim.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "rms_norm": rms_norm.ema_sq,
-        "wandb_run_id": wandb_run_id,
-        "log_dir": log_dir,
-    }
+    # Only rank 0 saves to disk
+    if rank == 0:
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        
+        ckpt = {
+            "epoch": epoch,
+            "global_update": global_update,
+            "enc": enc_state,
+            "dec": dec_state,
+            "optim": optim.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "rms_norm": rms_norm.ema_sq,
+            "wandb_run_id": wandb_run_id,
+            "log_dir": log_dir,
+        }
 
-    torch.save(ckpt, ckpt_path)
-    print(f"[rank0] Saved checkpoint to {ckpt_path}")
+        torch.save(ckpt, ckpt_path)
+        print(f"[rank0] Saved checkpoint to {ckpt_path}")
 
 def load_checkpoint(
     ckpt_path: str,
@@ -145,7 +145,7 @@ def load_checkpoint(
     log_dir = ckpt.get("log_dir", None)            # NEW
 
     # Load full enc/dec state dicts into FSDP models
-    full_cfg = FullStateDictConfig(rank0_only=False, cpu_offload=True)
+    full_cfg = FullStateDictConfig(rank0_only=False, offload_to_cpu=True)
 
     with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
         enc.load_state_dict(ckpt["enc"])
@@ -363,14 +363,15 @@ def main():
     # Batch size per GPU
     BATCH_PER_GPU = 1
     T = CONTEXT_T
-    NUM_EPOCHS = 3
-    STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
+    NUM_EPOCHS = 65
+    #STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
     GRAD_ACCUM_STEPS = 10  # simulate batch size 10 per GPU
     effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
 
     USE_COMPILE = True
+    CHECKPOINT_EVERY_N_UPDATES = 1000
 
     # Create models
     if rank == 0:
@@ -468,6 +469,7 @@ def main():
     optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01) # try increasing to 0.03–0.05? (apparently normal range for tokenizer)
 
     steps_per_epoch = len(train_loader)
+    STEPS_PER_EPOCH = steps_per_epoch
     total_steps = NUM_EPOCHS * steps_per_epoch // GRAD_ACCUM_STEPS
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
@@ -615,9 +617,6 @@ def main():
         accum_norm = 0.0
 
         for step_idx, batch in enumerate(train_loader):
-            if step_idx >= STEPS_PER_EPOCH:
-                break
-
             micro_idx = step_idx % GRAD_ACCUM_STEPS
             is_last_micro = (micro_idx == GRAD_ACCUM_STEPS - 1)
 
@@ -726,6 +725,24 @@ def main():
                     current_lr = scheduler.get_last_lr()[0]
                     tb_writer.add_scalar("train/lr", current_lr, global_update)
 
+                # Checkpoint every N updates (within epoch)
+                if global_update % CHECKPOINT_EVERY_N_UPDATES == 0:
+                    if rank == 0:
+                        print(f"[Checkpoint] Saving at global_update={global_update}")
+                    save_checkpoint(
+                        ckpt_path=ckpt_path,
+                        epoch=epoch,
+                        global_update=global_update,
+                        enc=enc,
+                        dec=dec,
+                        optim=optim,
+                        scheduler=scheduler,
+                        rms_norm=rms_norm,
+                        rank=rank,
+                        wandb_run_id=wandb_run_id,
+                        log_dir=log_dir,
+                    )
+
                 # Reset accumulators for next accumulation window
                 accum_mse = 0.0
                 accum_lpips = 0.0
@@ -740,10 +757,10 @@ def main():
             # Next data timing starts now (time until next batch is yielded)
             data_start = time.perf_counter()
 
-            # Print progress every 10 steps
-            if rank == 0 and (micro_idx == GRAD_ACCUM_STEPS - 1) and (global_update % 10 == 0):
-                avg_step_time = sum(step_times[-10:]) / len(step_times[-10:])
-                avg_data_time = sum(data_times[-10:]) / len(data_times[-10:])
+            # Print progress every 200 steps
+            if rank == 0 and is_last_micro and (global_update % 200 == 0):
+                avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
+                avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
                 frames_per_step = BATCH_PER_GPU * CONTEXT_T * world_size
                 step_fps = frames_per_step / avg_step_time
@@ -786,9 +803,6 @@ def main():
 
         with torch.no_grad():
             for step_idx, batch in enumerate(test_loader):
-                if step_idx >= STEPS_PER_EPOCH:
-                    break
-
                 images = batch['image'].to(device, non_blocking=True).to(torch.bfloat16)
                 actions = batch['action'].to(device, non_blocking=True).to(torch.bfloat16)
 

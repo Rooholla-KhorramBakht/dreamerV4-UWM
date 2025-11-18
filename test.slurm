@@ -6,7 +6,7 @@
 #SBATCH --constraint='h200'
 #SBATCH --cpus-per-task=16                 # CPU cores per GPU
 #SBATCH --mem=0                            # Request all memory on node
-#SBATCH --time=01:00:00                    # Max runtime
+#SBATCH --time=48:00:00                    # Max runtime
 #SBATCH --output=logs/dreamer_%j.out       # Output log
 #SBATCH --error=logs/dreamer_%j.err        # Error log
 #SBATCH --exclusive
