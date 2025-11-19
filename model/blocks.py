@@ -154,15 +154,15 @@ class Attention(nn.Module):
         if self.qk_norm:
             Q = F.normalize(Q, dim=-1)
             K = F.normalize(K, dim=-1)
-            Q = self.g*Q
+            Q_scaled = self.g*Q
 
         if self.rope_embedder is not None:
-            Q, K = self.rope_embedder(Q, K)
+            Q_rope_scaled, K_rope = self.rope_embedder(Q_scaled, K)
         
         if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 Y = F.scaled_dot_product_attention(
-                    Q, K, V,
+                    Q_rope_scaled, K_rope, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
                     is_causal=self.causal,
@@ -171,7 +171,7 @@ class Attention(nn.Module):
                 )  # [B, n_heads, Tq, dk]
         else:
                 Y = F.scaled_dot_product_attention(
-                    Q, K, V,
+                    Q_rope_scaled, K_rope, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
                     is_causal=self.causal,
