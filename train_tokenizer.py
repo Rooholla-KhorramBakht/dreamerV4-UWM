@@ -1,4 +1,3 @@
-
 import time
 from PIL import Image
 import hydra
@@ -20,18 +19,49 @@ import torch.optim as optim
 import lpips
 from pathlib import Path
 import wandb
+from transformers import get_cosine_schedule_with_warmup
+
+class RMSLossScaler:
+    """
+    Tracks running RMS for named losses and returns normalized losses.
+    """
+    def __init__(self, decay: float = 0.99, eps: float = 1e-8):
+        self.decay = decay
+        self.eps = eps
+        self.ema_sq = {}  # name -> scalar tensor
+
+    def __call__(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        # value is a scalar loss tensor (per-batch, per-rank)
+        with torch.no_grad():
+            sq = value.detach().pow(2)
+            mean_sq = sq.mean()
+
+            if name not in self.ema_sq:
+                self.ema_sq[name] = mean_sq
+            else:
+                self.ema_sq[name] = (
+                    self.decay * self.ema_sq[name] + (1.0 - self.decay) * mean_sq
+                )
+
+            rms = (self.ema_sq[name] + self.eps).sqrt()
+
+        # Normalize current loss by running RMS; gradient flows only through value
+        return value / rms
 
 def save_checkpoint(model, optimizer, step, epoch, cfg, scaler=None, scheduler=None):
     ckpt_dir = Path(cfg.output_dir) / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f"checkpoint_step_{step:07d}.pt"
 
+    # Fix: Access _orig_mod for compiled models
+    model_state = model._orig_mod.state_dict() if hasattr(model, '_orig_mod') else model.state_dict()
+
     checkpoint = {
-        "model": model.state_dict(),
+        "model": model_state,  # ← CHANGED
         "optimizer": optimizer.state_dict(),
         "step": step,
         "epoch": epoch,
-        "cfg": OmegaConf.to_container(cfg, resolve=True),  # snapshot config
+        "cfg": OmegaConf.to_container(cfg, resolve=True),
     }
 
     if scaler is not None:
@@ -42,7 +72,6 @@ def save_checkpoint(model, optimizer, step, epoch, cfg, scaler=None, scheduler=N
 
     torch.save(checkpoint, ckpt_path)
     print(f"🔒 Checkpoint saved at: {str(ckpt_path)}")
-
 
 def load_checkpoint(ckpt_path, model, optimizer=None, scaler=None, scheduler=None):
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -76,18 +105,20 @@ class ModelWrapper(nn.Module):
         self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
 
     def forward(self, images):
+        images = (images*2.)-1. # Translate the images in +-1 range
         tokens = self.patchifier(images)
         masked_tokens = self.masker(tokens)
         z, _ = self.encoder(masked_tokens)
         z_decoded = self.decoder(z)
         recon_images = self.image_head(z_decoded)
-        return recon_images
+        return  torch.clamp((recon_images + 1)/2., 0., 1.)
 
-@hydra.main(config_path="config", config_name="tokenizer.yaml")
+@hydra.main(config_path="config", config_name="tokenizer_small.yaml")
 def main(cfg: DictConfig):
     # --------------------------------------------------------------------
     #  W&B SETUP
     # --------------------------------------------------------------------
+    # wandb.init(project="dreamerv4-tokenizer")
     if cfg.wandb.enable:
         if cfg.wandb.api_key:
             wandb.login(key=cfg.wandb.api_key)
@@ -102,10 +133,6 @@ def main(cfg: DictConfig):
     # Torch configs
     if cfg.train.enable_fast_matmul:
         torch.set_float32_matmul_precision('high')
-    if cfg.train.enable_flash_attention:
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(False)
     device = cfg.train.device
 
     # Dataset and data loaders
@@ -124,6 +151,7 @@ def main(cfg: DictConfig):
         num_workers=cfg.train.num_workers,
         pin_memory=True,
         persistent_workers=True,
+        shuffle=True,
     )
 
     test_loader = DataLoader(
@@ -132,8 +160,9 @@ def main(cfg: DictConfig):
         num_workers=cfg.train.num_workers,
         pin_memory=True,
         persistent_workers=True,
+        shuffle=True,
     )
-
+    test_iter = iter(test_loader)
     if cfg.augmentation.enable:
         augmentor = torch.nn.Sequential(
             K.RandomGaussianBlur(tuple(cfg.augmentation.gaussian_blur.kernel_size),
@@ -153,22 +182,37 @@ def main(cfg: DictConfig):
     # Instantiate the model
     model = ModelWrapper(cfg)
     model.to(device)
-    print('Compiling the model...')
+    # print('Compiling the model...')
     model = torch.compile(model, mode=cfg.train.torch_compile_mode)
+    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     num_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     print(f"Number of encoder parameters (M): {num_params/1e6:.2f}M")
     num_params = sum(p.numel() for p in model.decoder.parameters() if p.requires_grad)
     print(f"Number of decoder parameters (M): {num_params/1e6:.2f}M")
 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=4000,
+        num_training_steps=5000000,
+        num_cycles=0.5
+    )
+    # RMS loss normalizer for tokenizer losses
+    rms_norm = RMSLossScaler(decay=0.99, eps=1e-8)
     mse_loss_fn = nn.MSELoss()
-    # lpips_loss_fn = lpips.LPIPS(net='vgg').eval().to(device)   # perceptual loss
-    optimizer = optim.Adam(model.parameters(), lr=cfg.train.lr)
+    lpips_model = lpips.LPIPS(net='vgg').to(device=device, dtype=torch.bfloat16)
+    lpips_model.eval()
+    for p in lpips_model.parameters():
+        p.requires_grad_(False)
+
     step = 0
+    print('Training started:')
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
             step += 1
             ctx_len = torch.randint(1, cfg.tokenizer.max_context_length,(1,)).item()
+            # ctx_len = 1
             imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
             if cfg.augmentation.enable:
                 B, T, C, H, W = imgs.shape
@@ -177,6 +221,7 @@ def main(cfg: DictConfig):
                 imgs = imgs.view(B, T, C, H, W).to(torch.float32)     # restore shape
 
             optimizer.zero_grad()
+            model.train()
             for _ in range(cfg.train.accum_grad_steps):
                 if cfg.train.mixed_precision:           
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -185,14 +230,48 @@ def main(cfg: DictConfig):
                 else:
                     recon_images = model(imgs)
                     mse = mse_loss_fn(recon_images, imgs)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    # 2) LPIPS perceptual loss expects images in [-1, 1]
+                    images_lpips = (imgs * 2.0) - 1.0          # [B, T, C, H, W] -> [-1,1]
+                    x_hat_lpips = (recon_images * 2.0) - 1.0
+
+                    # LPIPS implementation expects shape [B', C, H, W]; flatten time into batch
+                    B, T, C, H, W = images_lpips.shape
+                    images_lpips_flat = images_lpips.view(B * T, C, H, W)
+                    x_hat_lpips_flat = x_hat_lpips.view(B * T, C, H, W)
+
+                    lpips_val = lpips_model(x_hat_lpips_flat, images_lpips_flat)
+                    # Some LPIPS implementations return shape [B']; take mean over batch
+                    lpips_loss = lpips_val.mean()
+
+                # Pre-RMS total loss (for logging only): L_raw = mse + 0.2 * lpips
+                raw_loss = mse + 0.2 * lpips_loss
                 
                 #lp=lpips_loss_fn(recon_images.flatten(0,1), images.flatten(0,1)).mean()
                 #total_loss = mse + cfg.train.lpips_weight * lp
-                total_loss = mse
-                total_loss.backward()
+                # 3) RMS loss normalization per term
+                mse_norm = rms_norm("mse", mse)
+                lpips_norm = rms_norm("lpips", lpips_loss)
+
+                # 4) Combined tokenizer loss: L = LMSE + 0.2 * LLPIPS
+                loss = (mse_norm + 0.2 * lpips_norm) / cfg.train.accum_grad_steps
+                # Backward pass
+                loss.backward()
+            
+            if cfg.train.clip_grad_norm:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip_grad_norm)
+
             optimizer.step()
+            scheduler.step()
             if step % cfg.print_every==0:
-                print(f"MSE so far: {total_loss.item()}")
+                print(f"RMSE Loss: {loss.item()}, Raw_Loss: {raw_loss.item()}")
+                # wandb.log({
+                #     "epoch": epoch,
+                #     "training_loss": total_loss,
+                #     "lr": optimizer.param_groups[0]['lr'],
+                #     # "best loss": best_loss
+                # })
 
             # ------------------------------------------------------------------
             #  LOG LOSS TO WANDB
@@ -216,7 +295,7 @@ def main(cfg: DictConfig):
                         test_iter = iter(test_loader)
                         test_batch = next(test_iter)
 
-                    test_imgs = test_batch['observation.image'].to(torch.float32).to(device)
+                    test_imgs = test_batch['observation.image'].to(torch.float32).to(device)[:,:16,...]
                     B, T, C, H, W = test_imgs.shape
 
                     recon = model(test_imgs)               # (B, T, C, H, W)
@@ -265,6 +344,5 @@ def main(cfg: DictConfig):
                         wandb.log({"reconstruction_preview": wandb.Image(tiled_img_resized)}, step=step)
         save_checkpoint(model, optimizer, step, epoch, cfg)
 
-    model.train()
 if __name__ == '__main__':
     main()

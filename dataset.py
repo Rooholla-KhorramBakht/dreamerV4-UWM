@@ -3,7 +3,6 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
-
 class SingleViewSequenceDataset(Dataset):
     """
     Fast dataset for a single HDF5 sequence.
@@ -154,3 +153,126 @@ class SingleViewSequenceDataset(Dataset):
             "action": actions[:, : self.nu],                             # (T, nu)
         }
         return Dout
+    
+class ShardedHDF5Dataset(Dataset):
+    """
+    Dataset for sharded HDF5 files optimized for multi-node training.
+    Each worker preferentially reads from local shards when available.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        window_size: int,
+        stride: int = 1,
+        split: str = "train",          # "train" or "test"
+        train_fraction: float = 0.9,   # fraction of episodes in train
+        split_seed: int = 42,          # seed for reproducible split
+    ):
+        self.data_dir = Path(data_dir)
+        self.window_size = window_size
+        self.stride = stride
+        self.split = split
+        self.train_fraction = train_fraction
+        self.split_seed = split_seed
+
+        # Load metadata
+        with open(self.data_dir / 'metadata.json', 'r') as f:
+            self.metadata = json.load(f)
+
+        self.num_shards = self.metadata['num_shards']
+        self.shard_files = [
+            self.data_dir / f"shard_{i:04d}.h5"
+            for i in range(self.num_shards)
+        ]
+
+        # Build window index across all shards
+        self.windows = []
+        self.episode_lengths = []  # Store all episode lengths for analysis
+
+        for shard_idx, shard_file in enumerate(self.shard_files):
+            with h5py.File(shard_file, 'r') as f:
+                num_episodes = f.attrs['num_episodes']
+                lengths = f['episode_lengths'][:]
+
+                # Store episode lengths for statistics
+                self.episode_lengths.extend(lengths.tolist())
+
+                for ep_idx, ep_length in enumerate(lengths):
+                    for start in range(0, ep_length - window_size + 1, stride):
+                        self.windows.append((shard_idx, ep_idx, start))
+
+        # Collect all (shard_idx, ep_idx) pairs
+        all_episodes = sorted({(shard_idx, ep_idx) for shard_idx, ep_idx, _ in self.windows})
+
+        rng = np.random.default_rng(self.split_seed)
+        perm = rng.permutation(len(all_episodes))
+
+        num_train_eps = int(self.train_fraction * len(all_episodes))
+        train_eps = {all_episodes[i] for i in perm[:num_train_eps]}
+        test_eps  = {all_episodes[i] for i in perm[num_train_eps:]}
+
+        self.split_info = {
+            "train_episodes": sorted(list(train_eps)),
+            "test_episodes": sorted(list(test_eps)),
+        }
+
+        if self.split == "train":
+            keep = train_eps
+        elif self.split == "test":
+            keep = test_eps
+        else:
+            raise ValueError(f"Unknown split: {self.split}")
+
+        # Filter windows based on chosen split
+        self.windows = [w for w in self.windows if (w[0], w[1]) in keep]
+        print(f"{self.split.capitalize()} split: {len(self.windows)} windows "
+              f"from {len(keep)} episodes")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        shard_idx, ep_idx, start = self.windows[idx]
+        end = start + self.window_size
+
+        shard_file = self.shard_files[shard_idx]
+
+        # Open HDF5 file (each worker maintains its own handle)
+        with h5py.File(shard_file, 'r') as f:
+            images = f['images'][ep_idx, start:end]
+            actions = f['actions'][ep_idx, start:end]
+
+        # Convert to PyTorch
+        images = torch.from_numpy(images).float() / 255.0
+        images = images.permute(0, 3, 1, 2)
+        actions = torch.from_numpy(actions)
+        
+        return {'image': images, 'action': actions}
+
+
+    def get_episode_length_statistics(self):
+        """
+        Calculate comprehensive statistics about episode lengths.
+        
+        Returns:
+            dict with statistics about episode lengths
+        """
+        lengths = np.array(self.episode_lengths)
+        
+        stats = {
+            'total_episodes': len(lengths),
+            'total_timesteps': int(np.sum(lengths)),
+            'min_length': int(np.min(lengths)),
+            'max_length': int(np.max(lengths)),
+            'mean_length': float(np.mean(lengths)),
+            'median_length': float(np.median(lengths)),
+            'std_length': float(np.std(lengths)),
+            'percentile_25': float(np.percentile(lengths, 25)),
+            'percentile_75': float(np.percentile(lengths, 75)),
+            'percentile_90': float(np.percentile(lengths, 90)),
+            'percentile_95': float(np.percentile(lengths, 95)),
+            'percentile_99': float(np.percentile(lengths, 99)),
+        }
+        
+        return stats

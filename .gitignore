@@ -209,3 +209,4 @@ logs
 outputs
 checkpoints
 hpc
+tokenizer_ckpts

@@ -49,7 +49,7 @@ class TokenMasker(nn.Module):
         p = torch.empty((), device=device).uniform_(p_min, p_max)
 
         # mask shape: (B, 1, N, 1)
-        mask = torch.rand(B, 1, N, 1, device=device) < p
+        mask = torch.rand(B, T, N, 1, device=device) < p
 
         # Broadcast learned mask tokens to (B, T, N, D)
         mask_tokens = self.learned_masks.expand(B, T, N, D)

@@ -5,9 +5,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Tuple, Optional, List
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-# Todo: verify the implementation of SwiGLU numically matches the paper
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_hidden)
+        self.fc2 = nn.Linear(d_hidden, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.silu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+    
+
+class FeedForwardSwiGLU(nn.Module):
+    """
+    SwiGLU FFN:
+      y = down( dropout( SiLU(up(x)) * gate(x) ) )
+    Hidden size defaults to ~8/3 * d_model as commonly used in LLaMA/HF.
+    """
+    def __init__(self, d_model: int, d_hidden: int | None = None, dropout: float = 0.0, bias: bool = False):
+        super().__init__()
+        if d_hidden is None:
+            # 8/3 expansion; round to multiple of 8 for tensor cores if desired
+            d_hidden = (8 * d_model) // 3
+        self.up = nn.Linear(d_model, d_hidden, bias=bias)
+        self.gate = nn.Linear(d_model, d_hidden, bias=bias)
+        self.down = nn.Linear(d_hidden, d_model, bias=bias)
+        self.drop = nn.Dropout(dropout)
+
+    #@torch.compile(fullgraph=False, mode="reduce-overhead", dynamic=False)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u = F.silu(self.up(x))
+        g = self.gate(x)
+        h = self.drop(u * g)
+        return self.down(h)
+    
+
+
 class SwiGLU(nn.Module):
     """
     SwiGLU activation block from:
@@ -18,8 +58,8 @@ class SwiGLU(nn.Module):
     def __init__(self, dim_in, dim_hidden):
         super().__init__()
         # Two linear projections: W and V in the paper
-        self.W = nn.Linear(dim_in, dim_hidden, bias=True)
-        self.V = nn.Linear(dim_in, dim_hidden, bias=True)
+        self.W = nn.Linear(dim_in, dim_hidden, bias=False)
+        self.V = nn.Linear(dim_in, dim_hidden, bias=False)
 
     def forward(self, x):
         """
@@ -34,11 +74,10 @@ class SwiGLU(nn.Module):
         return swish_gate * xV          # elementwise product
 
 class RopeEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048, device = 'cpu'):
+    def __init__(self, dim, max_seq_len=2048):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
-        self.device = device
         # Cache the sin/cos computations to avoid recomputation
         thetas = torch.tensor([10000**(-2*i/dim) for i in range(dim//2)])
         thetas = torch.stack([thetas, thetas], dim=0).transpose(0,1).reshape(-1)
@@ -65,7 +104,7 @@ class Attention(nn.Module):
     """
     Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
     """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=False):
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=True):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
@@ -81,8 +120,8 @@ class Attention(nn.Module):
         self.W_k = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
         self.W_v = nn.Linear(self.d, self.dk*self.n_kv_heads, bias=False)
         self.W_o = nn.Linear(self.d, self.d, bias=False)
-        if not flash_attention:
-            self.register_buffer("g", torch.tensor(math.log2(float(max_seq_len**2-max_seq_len)), dtype=torch.float32)) # The normalization constant in QK-Norm is active.
+        if self.qk_norm:
+            self.g = nn.Parameter(torch.ones(1, self.n_heads, 1, 1) * math.log(max_seq_len))
 
     def forward(self,
                  q: torch.Tensor,
@@ -115,28 +154,30 @@ class Attention(nn.Module):
         if self.qk_norm:
             Q = F.normalize(Q, dim=-1)
             K = F.normalize(K, dim=-1)
+            Q = self.g*Q
 
         if self.rope_embedder is not None:
             Q, K = self.rope_embedder(Q, K)
         
-        if self.flash_attention:
-            Y = F.scaled_dot_product_attention(
-                Q, K, V,
-                attn_mask=mask, 
-                dropout_p=self.dropout_prob if self.training else 0.0,
-                is_causal=self.causal,
-                scale = None,
-                enable_gqa= False if self.n_kv_heads == self.n_heads else True,
-            )  # [B, n_heads, Tq, dk]
+        if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                Y = F.scaled_dot_product_attention(
+                    Q, K, V,
+                    attn_mask=mask, 
+                    dropout_p=self.dropout_prob if self.training else 0.0,
+                    is_causal=self.causal,
+                    scale = None,
+                    enable_gqa= False if self.n_kv_heads == self.n_heads else True,
+                )  # [B, n_heads, Tq, dk]
         else:
-            Y = F.scaled_dot_product_attention(
-                Q, K, V,
-                attn_mask=mask, 
-                dropout_p=self.dropout_prob if self.training else 0.0,
-                is_causal=self.causal,
-                scale = self.g,
-                enable_gqa= False if self.n_kv_heads == self.n_heads else True,
-            )  # [B, n_heads, Tq, dk]
+                Y = F.scaled_dot_product_attention(
+                    Q, K, V,
+                    attn_mask=mask, 
+                    dropout_p=self.dropout_prob if self.training else 0.0,
+                    is_causal=self.causal,
+                    scale = None,
+                    enable_gqa= False if self.n_kv_heads == self.n_heads else True,
+                )  # [B, n_heads, Tq, dk]
         Y = Y.transpose(1, 2).contiguous().view(B, T_q, self.d)
         Y = self.W_o(Y)
         return Y
@@ -173,104 +214,24 @@ class AxialAttention(nn.Module):
             assert mask.shape[-2] == q.shape[dim] and mask.shape[-1] == k.shape[dim], "Mask shape does not match the attention dimensions."
             if mask.dim() ==2:
                 mask = mask.unsqueeze(0)  # 1xTq xTk
-        Y = self.attn(reordered_q, reordered_k, reordered_v, mask)
-        Y = Y.view((dims_q[:dim]+dims_q[dim+1:-1]+[dims_q[dim], D])).transpose(dim, -2).contiguous()
+        Y = self.attn(reordered_q, reordered_k, reordered_v, mask) #...xT_dimxD
+        Y = Y.view((dims_q[:dim]+dims_q[dim+1:-1]+[dims_q[dim], D])).transpose(dim, -2).contiguous() # Verifiy if this line is actually needed
         return Y
 
-class AxialSelfAttentionBlock(nn.Module):
-    """
-    Axial Self-Attention block with residual connection and RMSNorm.
-    Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
-    """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
-        super().__init__()  
-        self.model_dim = model_dim  
-        self.n_heads = n_heads  
-        self.n_kv_heads = n_kv_heads
-        self.causal = causal    
-        self.dropout_prob = dropout_prob
-        self.qk_norm = qk_norm
-        self.max_seq_len = max_seq_len
-        self.rope_embedder = rope_embedder
-        
-        self.attnk = AxialAttention(
-            inner_attn=Attention(
-                model_dim=model_dim,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                causal=causal,
-                dropout_prob=dropout_prob,
-                qk_norm=qk_norm,
-                max_seq_len=max_seq_len,
-                rope_embedder=rope_embedder
-            )
-        )
-        self.Dense = nn.Linear(model_dim, model_dim)
-        self.rmsnorm = nn.RMSNorm(model_dim)
-    
-    def forward(self,
-                x: torch.Tensor, 
-                dim: int, 
-                mask: Optional[torch.Tensor] = None):
-        """
-        x: (B, dim1, ..., dimN, D)
-        dim: int, the dimension along which attention is applied
-        mask: Optional[torch.Tensor], attention mask
-        """
-        x_norm = self.rmsnorm(x)
-        attn_out = self.attnk(x_norm, x_norm, x_norm, dim, mask)
-        out = self.Dense(attn_out) + x
-        return out
-    
 class FeedForwardBlock(nn.Module):
     """
     Feed-Forward block with residual connection and RMSNorm.
     Uses SwiGLU nonlinearity.
     """
-    def __init__(self, model_dim):
+    def __init__(self, model_dim, dropout_prob=0.1):
         super().__init__()
         self.model_dim = model_dim
-        self.Dense1 = nn.Linear(model_dim, model_dim*4)
+        self.swiglu = SwiGLU(model_dim, model_dim*4)  # or hidden_dim
         self.Dense2 = nn.Linear(model_dim*4, model_dim)
-        self.rmsnorm = nn.RMSNorm(model_dim)
-        self.nonlinearity = SwiGLU(model_dim*4, model_dim*4)
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.rmsnorm(x)
-        x = self.Dense2(self.nonlinearity(self.Dense1(x))) + x
-        return x
-    
-class AxialEncoderBlock(nn.Module):
-    """
-    Axial Transformer Encoder block with Axial Self-Attention and Feed-Forward Network.
-    Operates along a chosen 1D axis of a N-D tensor (B, dim 1, ..., dim N, D).
-    """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
-        super().__init__()
-        self.model_dim = model_dim
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.causal = causal
-        self.dropout_prob = dropout_prob
-        self.qk_norm = qk_norm
-        self.max_seq_len = max_seq_len
-        self.rope_embedder = rope_embedder
-        self.attn_block = AxialSelfAttentionBlock(
-            model_dim=model_dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            causal=causal,
-            dropout_prob=dropout_prob,
-            qk_norm=qk_norm,
-            max_seq_len=max_seq_len,
-            rope_embedder=rope_embedder
-        )
-        self.ffn_block = FeedForwardBlock(model_dim=model_dim)
-    
-    def forward(self, x: torch.Tensor, dim: int, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.attn_block(x, dim, mask)
-        x = self.ffn_block(x)
-        return x    
+        return self.dropout(self.Dense2(self.swiglu(x)))
 
 class LayerType(Enum):
     SPATIAL = "spatial"
@@ -331,18 +292,24 @@ class EfficientTransformerBlock(nn.Module):
 
         # Factory to build Axial blocks
         def make_layer():
-            return AxialEncoderBlock(
+            return AxialAttention(
+                inner_attn=Attention(
                 model_dim=model_dim,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
+                causal=False,
                 dropout_prob=dropout_prob,
                 qk_norm=qk_norm,
                 max_seq_len=max_seq_len,
-                rope_embedder=self.rope,
+                rope_embedder=self.rope)
             )
 
         # One block per layer specification
-        self.layers = nn.ModuleList([make_layer() for _ in layer_types])
+        self.attentions = nn.ModuleList([make_layer() for _ in layer_types])
+        self.ffns = nn.ModuleList([FeedForwardSwiGLU(model_dim, None, dropout_prob) for _ in layer_types])
+        self.rms_norm1s = nn.ModuleList([nn.RMSNorm(model_dim) for _ in layer_types])
+        self.rms_norm2s = nn.ModuleList([nn.RMSNorm(model_dim) for _ in layer_types])
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(
         self,
@@ -360,59 +327,23 @@ class EfficientTransformerBlock(nn.Module):
         assert x.size(-1) == self.model_dim, \
             f"Expected last dim = {self.model_dim}, got {x.size(-1)}"
 
-        for layer_type, layer in zip(self.layer_types, self.layers):
+        for i in range(len(self.layer_types)):
+            layer_type = self.layer_types[i]
+            norm1 = self.rms_norm1s[i]
+            norm2 = self.rms_norm2s[i]
+            ffn = self.ffns[i]
+            atn = self.attentions[i]
+
             if layer_type == LayerType.SPATIAL:
-                x = layer(x, dim=2, mask=spatial_mask)
-            else:  # LayerType.TEMPORAL
-                x = layer(x, dim=1, mask=temporal_mask)
+                attn_input = norm1(x)
+                x = x + self.dropout(atn(attn_input, attn_input, attn_input, dim=2, mask=spatial_mask))
+                ffn_input = norm2(x)
+                x = x + self.dropout(ffn(ffn_input))
+            else:
+                # Temporal layers follow same pattern
+                attn_input = norm1(x)
+                x = x + self.dropout(atn(attn_input, attn_input, attn_input, dim=1, mask=temporal_mask))
+                ffn_input = norm2(x)
+                x = x + self.dropout(ffn(ffn_input))
 
         return x
-    
-class AxialCrossAttentionBlock(nn.Module):
-    """
-    Axial Cross-Attention block with residual connection and RMSNorm.
-    Operates along a chosen 1D axis of a N-D tensor (B, dim1, ..., dimN, D).
-    """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None):
-        super().__init__()  
-        self.model_dim = model_dim  
-        self.n_heads = n_heads  
-        self.n_kv_heads = n_kv_heads
-        self.causal = causal    
-        self.dropout_prob = dropout_prob
-        self.qk_norm = qk_norm
-        self.max_seq_len = max_seq_len
-        self.rope_embedder = rope_embedder
-        
-        self.attnk = AxialAttention(
-            inner_attn=Attention(
-                model_dim=model_dim,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                causal=causal,
-                dropout_prob=dropout_prob,
-                qk_norm=qk_norm,
-                max_seq_len=max_seq_len,
-                rope_embedder=rope_embedder
-            )
-        )
-        self.Dense = nn.Linear(model_dim, model_dim)
-        self.rmsnorm1 = nn.RMSNorm(model_dim)
-        self.rmsnorm2 = nn.RMSNorm(model_dim)
-
-    def forward(self,
-                x: torch.Tensor, 
-                context: torch.Tensor,
-                dim: int, 
-                mask: Optional[torch.Tensor] = None):
-        """
-        x: (B, dim1, ..., dimN, D)
-        context: (B, dim1, ..., dimM, D)
-        dim: int, the dimension along which attention is applied
-        mask: Optional[torch.Tensor], attention mask
-        """
-        x = self.rmsnorm1(x)
-        context = self.rmsnorm2(context)
-        attn_out = self.attnk(x, context, context, dim, mask)
-        out = self.Dense(attn_out) + x
-        return out
