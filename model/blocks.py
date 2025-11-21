@@ -22,7 +22,6 @@ class FeedForward(nn.Module):
         x = self.fc2(x)
         return x
     
-
 class FeedForwardSwiGLU(nn.Module):
     """
     SwiGLU FFN:
@@ -46,8 +45,6 @@ class FeedForwardSwiGLU(nn.Module):
         h = self.drop(u * g)
         return self.down(h)
     
-
-
 class SwiGLU(nn.Module):
     """
     SwiGLU activation block from:
@@ -104,7 +101,7 @@ class Attention(nn.Module):
     """
     Multi-head (self/cross) attention block with optional QK-Norm and RoPE and GQA.
     """
-    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=True):
+    def __init__(self, model_dim, n_heads, n_kv_heads=None, causal = False, dropout_prob = 0, qk_norm=True, max_seq_len=128, rope_embedder = None, flash_attention=False):
         super().__init__()
         assert model_dim%n_heads==0, 'Model dimension should be devisible by the number of heads'
         self.d = model_dim
@@ -154,15 +151,15 @@ class Attention(nn.Module):
         if self.qk_norm:
             Q = F.normalize(Q, dim=-1)
             K = F.normalize(K, dim=-1)
-            Q_scaled = self.g*Q
+            Q = self.g*Q
 
         if self.rope_embedder is not None:
-            Q_rope_scaled, K_rope = self.rope_embedder(Q_scaled, K)
+            Q, K = self.rope_embedder(Q, K)
         
         if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 Y = F.scaled_dot_product_attention(
-                    Q_rope_scaled, K_rope, V,
+                    Q, K, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
                     is_causal=self.causal,
@@ -171,7 +168,7 @@ class Attention(nn.Module):
                 )  # [B, n_heads, Tq, dk]
         else:
                 Y = F.scaled_dot_product_attention(
-                    Q_rope_scaled, K_rope, V,
+                    Q, K, V,
                     attn_mask=mask, 
                     dropout_p=self.dropout_prob if self.training else 0.0,
                     is_causal=self.causal,
@@ -237,26 +234,81 @@ class LayerType(Enum):
     SPATIAL = "spatial"
     TEMPORAL = "temporal"
 
+class EfficientTransformerLayer(nn.Module):
+    """
+    A single axial transformer layer:
+    - RMSNorm → AxialAttention (spatial or temporal)
+    - RMSNorm → FeedForwardSwiGLU
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        max_seq_len: int,
+        layer_type: LayerType,
+        dropout_prob: float = 0.0,
+        qk_norm: bool = True,
+        rope_embedder: Optional[RopeEmbedding] = None,
+    ):
+        super().__init__()
+        assert isinstance(layer_type, LayerType)
+
+        self.layer_type = layer_type
+        self.model_dim = model_dim
+
+        # Use shared RoPE if available
+        self.rope = rope_embedder or RopeEmbedding(model_dim // n_heads, max_seq_len)
+
+        # Axial attention
+        self.attn = AxialAttention(
+            inner_attn=Attention(
+                model_dim=model_dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                causal=False,
+                dropout_prob=dropout_prob,
+                qk_norm=qk_norm,
+                max_seq_len=max_seq_len,
+                rope_embedder=self.rope,
+            )
+        )
+
+        # FFN + norms
+        self.norm1 = nn.RMSNorm(model_dim)
+        self.norm2 = nn.RMSNorm(model_dim)
+        self.ffn = FeedForwardSwiGLU(model_dim, None, dropout_prob)
+        self.dropout = nn.Dropout(dropout_prob)
+
+    def forward(self, x, temporal_mask=None, spatial_mask=None):
+        """
+        x: (B, T, S, D)
+        """
+
+        # pick dimension and mask
+        if self.layer_type == LayerType.SPATIAL:
+            attn_dim = 2
+            mask = spatial_mask
+        else:
+            attn_dim = 1
+            mask = temporal_mask
+
+        # Attention block
+        h = self.norm1(x)
+        h = self.attn(h, h, h, dim=attn_dim, mask=mask)
+        x = x + self.dropout(h)
+
+        # FFN block
+        h = self.norm2(x)
+        h = self.ffn(h)
+        x = x + self.dropout(h)
+
+        return x
+
 class EfficientTransformerBlock(nn.Module):
     """
-    A block composed of spatial and/or temporal axial-attention layers,
-    in the order specified by `layer_types`.
-
-    Expected input:
-        x: (B, T, S, D)
-            B = batch size
-            T = temporal dimension
-            S = spatial dimension (e.g., patches)
-            D = embedding dimension
-
-    Args:
-        model_dim: embedding dimension D
-        n_heads: number of attention heads
-        n_kv_heads: number of key/value heads
-        max_seq_len: maximum sequence length for RoPE
-        dropout_prob: dropout probability
-        qk_norm: enable QK normalization
-        layer_types: sequence of LayerType enums defining the order of layers
+    A sequence of EfficientTransformerLayer objects.
     """
 
     def __init__(
@@ -271,7 +323,7 @@ class EfficientTransformerBlock(nn.Module):
     ):
         super().__init__()
 
-        # Default block: 3 spatial layers + 1 temporal layer
+        # Default block layout
         if layer_types is None:
             layer_types = [
                 LayerType.SPATIAL,
@@ -280,70 +332,145 @@ class EfficientTransformerBlock(nn.Module):
                 LayerType.TEMPORAL,
             ]
 
-        # Validate layer types
-        if not all(isinstance(t, LayerType) for t in layer_types):
-            raise TypeError("layer_types must be a list of LayerType enums")
+        # Shared RoPE
+        rope = RopeEmbedding(model_dim // n_heads, max_seq_len)
 
-        self.layer_types = layer_types
-        self.model_dim = model_dim
-
-        # Shared RoPE embedder
-        self.rope = RopeEmbedding(model_dim//n_heads, max_seq_len)
-
-        # Factory to build Axial blocks
-        def make_layer():
-            return AxialAttention(
-                inner_attn=Attention(
+        # Build layers
+        self.layers = nn.ModuleList([
+            EfficientTransformerLayer(
                 model_dim=model_dim,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
-                causal=False,
+                max_seq_len=max_seq_len,
+                layer_type=t,
                 dropout_prob=dropout_prob,
                 qk_norm=qk_norm,
-                max_seq_len=max_seq_len,
-                rope_embedder=self.rope)
+                rope_embedder=rope,
+            )
+            for t in layer_types
+        ])
+
+        self.model_dim = model_dim
+
+    def forward(self, x, temporal_mask=None, spatial_mask=None):
+        assert x.size(-1) == self.model_dim
+
+        for layer in self.layers:
+            x = layer(
+                x,
+                temporal_mask=temporal_mask,
+                spatial_mask=spatial_mask,
             )
 
-        # One block per layer specification
-        self.attentions = nn.ModuleList([make_layer() for _ in layer_types])
-        self.ffns = nn.ModuleList([FeedForwardSwiGLU(model_dim, None, dropout_prob) for _ in layer_types])
-        self.rms_norm1s = nn.ModuleList([nn.RMSNorm(model_dim) for _ in layer_types])
-        self.rms_norm2s = nn.ModuleList([nn.RMSNorm(model_dim) for _ in layer_types])
-        self.dropout = nn.Dropout(dropout_prob)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        temporal_mask: Optional[torch.Tensor] = None,
-        spatial_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: input tensor of shape (B, T, S, D)
-            temporal_mask: (T, T) or (B, T, T)
-            spatial_mask: (S, S) or (B, S, S)
-        """
-        # Basic shape check
-        assert x.size(-1) == self.model_dim, \
-            f"Expected last dim = {self.model_dim}, got {x.size(-1)}"
-
-        for i in range(len(self.layer_types)):
-            layer_type = self.layer_types[i]
-            norm1 = self.rms_norm1s[i]
-            norm2 = self.rms_norm2s[i]
-            ffn = self.ffns[i]
-            atn = self.attentions[i]
-
-            if layer_type == LayerType.SPATIAL:
-                attn_input = norm1(x)
-                x = x + self.dropout(atn(attn_input, attn_input, attn_input, dim=2, mask=spatial_mask))
-                ffn_input = norm2(x)
-                x = x + self.dropout(ffn(ffn_input))
-            else:
-                # Temporal layers follow same pattern
-                attn_input = norm1(x)
-                x = x + self.dropout(atn(attn_input, attn_input, attn_input, dim=1, mask=temporal_mask))
-                ffn_input = norm2(x)
-                x = x + self.dropout(ffn(ffn_input))
-
         return x
+
+# class EfficientTransformerBlock(nn.Module):
+#     """
+#     A block composed of spatial and/or temporal axial-attention layers,
+#     in the order specified by `layer_types`.
+
+#     Expected input:
+#         x: (B, T, S, D)
+#             B = batch size
+#             T = temporal dimension
+#             S = spatial dimension (e.g., patches)
+#             D = embedding dimension
+
+#     Args:
+#         model_dim: embedding dimension D
+#         n_heads: number of attention heads
+#         n_kv_heads: number of key/value heads
+#         max_seq_len: maximum sequence length for RoPE
+#         dropout_prob: dropout probability
+#         qk_norm: enable QK normalization
+#         layer_types: sequence of LayerType enums defining the order of layers
+#     """
+
+#     def __init__(
+#         self,
+#         model_dim: int,
+#         n_heads: int,
+#         n_kv_heads: int,
+#         max_seq_len: int,
+#         dropout_prob: float = 0.0,
+#         qk_norm: bool = True,
+#         layer_types: Optional[List[LayerType]] = None,
+#     ):
+#         super().__init__()
+
+#         # Default block: 3 spatial layers + 1 temporal layer
+#         if layer_types is None:
+#             layer_types = [
+#                 LayerType.SPATIAL,
+#                 LayerType.SPATIAL,
+#                 LayerType.SPATIAL,
+#                 LayerType.TEMPORAL,
+#             ]
+
+#         # Validate layer types
+#         if not all(isinstance(t, LayerType) for t in layer_types):
+#             raise TypeError("layer_types must be a list of LayerType enums")
+
+#         self.layer_types = layer_types
+#         self.model_dim = model_dim
+
+#         # Shared RoPE embedder
+#         self.rope = RopeEmbedding(model_dim//n_heads, max_seq_len)
+
+#         # Factory to build Axial blocks
+#         def make_layer():
+#             return AxialAttention(
+#                 inner_attn=Attention(
+#                 model_dim=model_dim,
+#                 n_heads=n_heads,
+#                 n_kv_heads=n_kv_heads,
+#                 causal=False,
+#                 dropout_prob=dropout_prob,
+#                 qk_norm=qk_norm,
+#                 max_seq_len=max_seq_len,
+#                 rope_embedder=self.rope)
+#             )
+
+#         # One block per layer specification
+#         self.attentions = nn.ModuleList([make_layer() for _ in layer_types])
+#         self.ffns = nn.ModuleList([FeedForwardSwiGLU(model_dim, None, dropout_prob) for _ in layer_types])
+#         self.rms_norm1s = nn.ModuleList([nn.RMSNorm(model_dim) for _ in layer_types])
+#         self.rms_norm2s = nn.ModuleList([nn.RMSNorm(model_dim) for _ in layer_types])
+#         self.dropout = nn.Dropout(dropout_prob)
+
+#     def forward(
+#         self,
+#         x: torch.Tensor,
+#         temporal_mask: Optional[torch.Tensor] = None,
+#         spatial_mask: Optional[torch.Tensor] = None,
+#     ) -> torch.Tensor:
+#         """
+#         Args:
+#             x: input tensor of shape (B, T, S, D)
+#             temporal_mask: (T, T) or (B, T, T)
+#             spatial_mask: (S, S) or (B, S, S)
+#         """
+#         # Basic shape check
+#         assert x.size(-1) == self.model_dim, \
+#             f"Expected last dim = {self.model_dim}, got {x.size(-1)}"
+
+#         for i in range(len(self.layer_types)):
+#             layer_type = self.layer_types[i]
+#             norm1 = self.rms_norm1s[i]
+#             norm2 = self.rms_norm2s[i]
+#             ffn = self.ffns[i]
+#             atn = self.attentions[i]
+
+#             if layer_type == LayerType.SPATIAL:
+#                 attn_input = norm1(x)
+#                 x = x + self.dropout(atn(attn_input, attn_input, attn_input, dim=2, mask=spatial_mask))
+#                 ffn_input = norm2(x)
+#                 x = x + self.dropout(ffn(ffn_input))
+#             else:
+#                 # Temporal layers follow same pattern
+#                 attn_input = norm1(x)
+#                 x = x + self.dropout(atn(attn_input, attn_input, attn_input, dim=1, mask=temporal_mask))
+#                 ffn_input = norm2(x)
+#                 x = x + self.dropout(ffn(ffn_input))
+
+#         return x

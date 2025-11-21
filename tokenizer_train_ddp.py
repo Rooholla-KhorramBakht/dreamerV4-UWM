@@ -1,34 +1,29 @@
 import os
 import time
+import hydra
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
-)
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    ShardingStrategy,
-    MixedPrecision,
-    BackwardPrefetch,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
+from torch.nn.parallel import DistributedDataParallel as DDP
 from model.tokenizer import (CausalTokenizerDecoder, 
                              CausalTokenizerEncoder, 
                              CausalTokenizerConfig, 
+                             LinearTokensToImageHead,
                              TokensToImageHead, 
                              ImagePatchifier)
+from model.blocks import EfficientTransformerBlock
 from model.utils import TokenMasker
 
 from dataset import ShardedHDF5Dataset
 import lpips
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.utils as nn_utils
 import wandb
 import datetime
 import math
@@ -41,7 +36,7 @@ class ModelWrapper(nn.Module):
         self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
-        self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
+        self.image_head = LinearTokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
         self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
 
     def forward(self, images):
@@ -90,7 +85,7 @@ def save_checkpoint(
     ckpt_path: str,
     epoch: int,
     global_update: int,
-    model: FSDP,
+    model: nn.Module,
     optim: torch.optim.Optimizer,
     scheduler,
     rms_norm: RMSLossScaler,
@@ -100,19 +95,12 @@ def save_checkpoint(
 ):
     """
     Save a FULL checkpoint (unsharded enc/dec) on rank 0.
-    ALL RANKS must call this function for FSDP collectives to work.
     """
-    # Gather full (unsharded) state dicts on CPU
-    # ALL RANKS must participate in this, even though only rank 0 gets the result
-    full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
-        model_state = model.state_dict()  # All ranks participate in gather
 
     # Only rank 0 saves to disk
     if rank == 0:
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        
+        model_state = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
         ckpt = {
             "epoch": epoch,
             "global_update": global_update,
@@ -129,7 +117,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     ckpt_path: str,
-    model: FSDP,
+    model: nn.Module,
     optim: torch.optim.Optimizer,
     scheduler,
     rms_norm: RMSLossScaler,
@@ -161,12 +149,13 @@ def load_checkpoint(
     global_update = ckpt.get("global_update", 0)
     wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
     log_dir = ckpt.get("log_dir", None)            # NEW
+    # DDP: load into wrapped model
+    state_dict = ckpt["model"]
 
-    # Load full enc/dec state dicts into FSDP models
-    full_cfg = FullStateDictConfig(rank0_only=False, offload_to_cpu=True)
-
-    with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
-        model.load_state_dict(ckpt["model"])
+    if isinstance(model, DDP):
+        model.module.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
 
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])
@@ -212,48 +201,6 @@ def cleanup_distributed():
     """Clean up distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
-
-def get_fsdp_wrap_policy():
-    """Define which layers to wrap with FSDP."""
-    return partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            BlockCausalEncoderLayer,
-            BlockCausalDecoderLayer,
-        },
-    )
-
-def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"):
-    """Wrap model with FSDP for distributed training."""
-    # Mixed precision policy for H200
-    if mixed_precision:
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
-    else:
-        mp_policy = None
-    
-    # Map string to ShardingStrategy enum
-    strategy_map = {
-        "FULL_SHARD": ShardingStrategy.FULL_SHARD,
-        "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
-        "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
-    }
-    
-    fsdp_model = FSDP(
-        model,
-        sharding_strategy=strategy_map[sharding_strategy],
-        auto_wrap_policy=get_fsdp_wrap_policy(),
-        mixed_precision=mp_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        device_id=torch.cuda.current_device(),
-        limit_all_gathers=True,
-        use_orig_params=True,
-    )
-    
-    return fsdp_model
 
 def create_distributed_dataloader(
     data_dir: str,
@@ -326,7 +273,6 @@ def main(cfg: DictConfig):
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
     
-    # LPIPS model (perceptual loss), kept outside FSDP and frozen
     # Initialize only on rank 0 to avoid concurrent downloads; broadcast to other ranks
     if rank == 0:
         # Load with pretrained on rank 0 (succeeds reliably)
@@ -371,16 +317,15 @@ def main(cfg: DictConfig):
     D_MODEL = 768
     N_LAYERS = 12
     HEADS_Q = 12
-    HEADS_KV_LATENT = 12
+    HEADS_KV_LATENT = 16
     MLP_RATIO = 4.0
     TEMPORAL_EVERY = 4
     
     # Batch size per GPU
     BATCH_PER_GPU = 1
-    T = CONTEXT_T
-    NUM_EPOCHS = 65
-    #STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
-    GRAD_ACCUM_STEPS = 10  # simulate batch size 10 per GPU
+    NUM_EPOCHS = 3
+    STEPS_PER_EPOCH = 50  # Limit steps per epoch for faster benchmarking
+    GRAD_ACCUM_STEPS = 1  # simulate batch size 10 per GPU
     effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
@@ -396,18 +341,13 @@ def main(cfg: DictConfig):
     model.to(device)
 
     if USE_COMPILE:
-        # Good starting config; you can try other modes later
-        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        model = torch.compile(model, mode="max-autotune", fullgraph=True)
 
     # Print parameter counts
     if rank == 0:
-        learnable_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-        learnable_params += sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+        learnable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Total learnable parameters: {learnable_params:,}")
     
-    # Wrap with FSDP
-    if rank == 0:
-        print("Wrapping models with FSDP...")
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
         data_dir="/scratch/ja5009/soar_data_sharded/",
@@ -441,9 +381,13 @@ def main(cfg: DictConfig):
         drop_last=False,  # keep all test windows
     )
 
-    enc = setup_fsdp_model(enc, mixed_precision=True, sharding_strategy="FULL_SHARD")
-    dec = setup_fsdp_model(dec, mixed_precision=True, sharding_strategy="FULL_SHARD")
-
+    model = DDP(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=True,
+        broadcast_buffers=True,
+    )
     # Create optimizer
     params = model.parameters()
     optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01) # try increasing to 0.03–0.05? (apparently normal range for tokenizer)
@@ -467,8 +411,7 @@ def main(cfg: DictConfig):
         # Try loading checkpoint BEFORE initializing W&B
         start_epoch, global_update, wandb_run_id, log_dir = load_checkpoint(
             ckpt_path=ckpt_path,
-            enc=enc,
-            dec=dec,
+            model= model,
             optim=optim,
             scheduler=scheduler,
             rms_norm=rms_norm,
@@ -492,62 +435,61 @@ def main(cfg: DictConfig):
             print(f"Reusing log directory: {log_dir}")
 
         # Initialize W&B with resume logic
-        if cfg.wandb.enable:
-            if wandb_run_id is not None:
-                # Resuming an existing run
-                wandb.init(
-                    project="dreamer-v4-tokenizer",
-                    id=wandb_run_id,
-                    resume="must",  # or "must" if you want to error if run doesn't exist
-                    config={
-                        "img_h": IMG_H,
-                        "img_w": IMG_W,
-                        "context_t": CONTEXT_T,
-                        "n_latents": N_LATENTS,
-                        "bottleneck_d": BOTTLENECK_D,
-                        "d_model": D_MODEL,
-                        "n_layers": N_LAYERS,
-                        "heads_q": HEADS_Q,
-                        "heads_kv_latent": HEADS_KV_LATENT,
-                        "mlp_ratio": MLP_RATIO,
-                        "temporal_every": TEMPORAL_EVERY,
-                        "batch_per_gpu": BATCH_PER_GPU,
-                        "grad_accum_steps": GRAD_ACCUM_STEPS,
-                        "lr": 1e-4,
-                        "weight_decay": 0.01,
-                        "use_compile": USE_COMPILE,
-                    },
-                    sync_tensorboard=True,
-                    dir=log_dir,
-                )
-            else:
-                # Starting a new run
-                wandb.init(
-                    project="dreamer-v4-tokenizer",
-                    name=f"run_nodes{world_size//8}_gpus{world_size}",
-                    config={
-                        "img_h": IMG_H,
-                        "img_w": IMG_W,
-                        "context_t": CONTEXT_T,
-                        "n_latents": N_LATENTS,
-                        "bottleneck_d": BOTTLENECK_D,
-                        "d_model": D_MODEL,
-                        "n_layers": N_LAYERS,
-                        "heads_q": HEADS_Q,
-                        "heads_kv_latent": HEADS_KV_LATENT,
-                        "mlp_ratio": MLP_RATIO,
-                        "temporal_every": TEMPORAL_EVERY,
-                        "batch_per_gpu": BATCH_PER_GPU,
-                        "grad_accum_steps": GRAD_ACCUM_STEPS,
-                        "lr": 1e-4,
-                        "weight_decay": 0.01,
-                        "use_compile": USE_COMPILE,
-                    },
-                    sync_tensorboard=True,
-                    dir=log_dir,
-                )
-            # Capture the W&B run ID for saving in checkpoint
-            wandb_run_id = wandb.run.id
+        if wandb_run_id is not None:
+            # Resuming an existing run
+            wandb.init(
+                project="dreamer-v4-tokenizer",
+                id=wandb_run_id,
+                resume="must",  # or "must" if you want to error if run doesn't exist
+                config={
+                    "img_h": IMG_H,
+                    "img_w": IMG_W,
+                    "context_t": CONTEXT_T,
+                    "n_latents": N_LATENTS,
+                    "bottleneck_d": BOTTLENECK_D,
+                    "d_model": D_MODEL,
+                    "n_layers": N_LAYERS,
+                    "heads_q": HEADS_Q,
+                    "heads_kv_latent": HEADS_KV_LATENT,
+                    "mlp_ratio": MLP_RATIO,
+                    "temporal_every": TEMPORAL_EVERY,
+                    "batch_per_gpu": BATCH_PER_GPU,
+                    "grad_accum_steps": GRAD_ACCUM_STEPS,
+                    "lr": 1e-4,
+                    "weight_decay": 0.01,
+                    "use_compile": USE_COMPILE,
+                },
+                sync_tensorboard=True,
+                dir=log_dir,
+            )
+        else:
+            # Starting a new run
+            wandb.init(
+                project="dreamer-v4-tokenizer",
+                name=f"run_nodes{world_size//8}_gpus{world_size}",
+                config={
+                    "img_h": IMG_H,
+                    "img_w": IMG_W,
+                    "context_t": CONTEXT_T,
+                    "n_latents": N_LATENTS,
+                    "bottleneck_d": BOTTLENECK_D,
+                    "d_model": D_MODEL,
+                    "n_layers": N_LAYERS,
+                    "heads_q": HEADS_Q,
+                    "heads_kv_latent": HEADS_KV_LATENT,
+                    "mlp_ratio": MLP_RATIO,
+                    "temporal_every": TEMPORAL_EVERY,
+                    "batch_per_gpu": BATCH_PER_GPU,
+                    "grad_accum_steps": GRAD_ACCUM_STEPS,
+                    "lr": 1e-4,
+                    "weight_decay": 0.01,
+                    "use_compile": USE_COMPILE,
+                },
+                sync_tensorboard=True,
+                dir=log_dir,
+            )
+        # Capture the W&B run ID for saving in checkpoint
+        wandb_run_id = wandb.run.id
 
         tb_writer = SummaryWriter(log_dir=log_dir)
     else:
@@ -573,187 +515,162 @@ def main(cfg: DictConfig):
     epoch_losses = []
     epoch_fps = []
     epoch_data_times = []
-
+    
     for epoch in range(start_epoch, NUM_EPOCHS):
-        # --- TRAIN PHASE ---
         model.train()
-
-        # CRITICAL: Set epoch for DistributedSampler to reshuffle data
         train_sampler.set_epoch(epoch)
 
         epoch_start = time.perf_counter()
         epoch_loss_sum = 0.0
         step_times = []
         data_times = []
-        data_start = time.perf_counter()
 
         num_updates = 0
-
-        # Accumulators over the current accumulation window
         accum_mse = 0.0
         accum_lpips = 0.0
-        accum_raw_loss = 0.0  # mse + 0.2 * lpips
+        accum_raw_loss = 0.0
         accum_norm = 0.0
+        torch.cuda.synchronize(device=None)
+        data_start = time.perf_counter()
 
         for step_idx, batch in enumerate(train_loader):
-            micro_idx = step_idx % GRAD_ACCUM_STEPS
-            is_last_micro = (micro_idx == GRAD_ACCUM_STEPS - 1)
-
-            # --- measure how long we waited for this batch to arrive ---
-            data_end = time.perf_counter()
-            data_time = data_end - data_start
+            if num_updates >= STEPS_PER_EPOCH:
+                break
+            # ------------------------------
+            # Measure data loading time
+            # ------------------------------
+            torch.cuda.synchronize(device=None)
+            data_time = time.perf_counter() - data_start
             data_times.append(data_time)
 
-            # Move data to device
-            images = batch['image'].to(device, non_blocking=True)  # (B, T, C, H, W)
-            actions = batch['action'].to(device, non_blocking=True)  # (B, T, action_dim)
+            is_first_micro = (step_idx % GRAD_ACCUM_STEPS) == 0
+            is_update_step = (step_idx + 1) % GRAD_ACCUM_STEPS == 0
 
-            # Convert to bfloat16
-            images = images.to(torch.bfloat16)
-            actions = actions.to(torch.bfloat16)
-
-            # Time the training step
-            torch.cuda.synchronize(device)
-            step_start = time.perf_counter()
-
-            # Forward pass
-            # Zero grads at the start of each accumulation window
-            if micro_idx == 0:
+            if is_first_micro:
+                torch.compiler.cudagraph_mark_step_begin() 
                 optim.zero_grad(set_to_none=True)
 
-            x_hat = model(images)
+            # Move data
+            images = batch['image'].to(device, non_blocking=True).to(torch.bfloat16)
 
-            # --- Tokenizer reconstruction losses: MSE + 0.2 * LPIPS, with RMS normalization ---
-
-            # 1) Pixel MSE in the native scale of your data
-            mse_loss = nn.functional.mse_loss(x_hat, images)
+            # ------------------------------
+            # Forward
+            # ------------------------------
+            torch.cuda.synchronize(device=None)
+            step_start = time.perf_counter()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                # 2) LPIPS perceptual loss expects images in [-1, 1]
-                images_lpips = (images * 2.0) - 1.0          # [B, T, C, H, W] -> [-1,1]
-                x_hat_lpips = (x_hat * 2.0) - 1.0
+                torch.cuda.synchronize(device=None)
+                forward_time_tik = time.perf_counter()
+                x_hat = model(images)
+                torch.cuda.synchronize(device=None)
+                forward_time = time.perf_counter() - forward_time_tik
 
-                # LPIPS implementation expects shape [B', C, H, W]; flatten time into batch
-                B, T, C, H, W = images_lpips.shape
-                images_lpips_flat = images_lpips.view(B * T, C, H, W)
-                x_hat_lpips_flat = x_hat_lpips.view(B * T, C, H, W)
+                mse_loss = nn.functional.mse_loss(x_hat, images)
 
-                lpips_val = lpips_model(x_hat_lpips_flat, images_lpips_flat)
-                # Some LPIPS implementations return shape [B']; take mean over batch
-                lpips_loss = lpips_val.mean()
+                # disabled LPIPS for now
+                lpips_loss = torch.zeros_like(mse_loss)
 
-            # Pre-RMS total loss (for logging only): L_raw = mse + 0.2 * lpips
             raw_loss = mse_loss + 0.2 * lpips_loss
 
-            # Update accumulators (CPU scalars)
-            accum_mse += mse_loss.detach().item()
-            accum_lpips += lpips_loss.detach().item()
-            accum_raw_loss += raw_loss.detach().item()
+            # update CPU-side accumulators
+            accum_mse += mse_loss.item()
+            accum_lpips += lpips_loss.item()
+            accum_raw_loss += raw_loss.item()
 
-            # 3) RMS loss normalization per term
+            # normalized losses
             mse_norm = rms_norm("mse", mse_loss)
             lpips_norm = rms_norm("lpips", lpips_loss)
 
-            # 4) Combined tokenizer loss: L = LMSE + 0.2 * LLPIPS
             loss = (mse_norm + 0.2 * lpips_norm) / GRAD_ACCUM_STEPS
-            accum_norm = accum_norm + loss.detach().item()
-
-            # Backward pass
+            accum_norm += loss.item()
+            torch.cuda.synchronize(device=None)
+            backward_time_tik = time.perf_counter()
+            # backward
             loss.backward()
+            torch.cuda.synchronize(device=None)
+            backward_time = time.perf_counter() - backward_time_tik
 
-            # If this is the last micro-batch in the window, do optimizer step
-            if is_last_micro:
-                #torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-                model.clip_grad_norm_(max_norm=1.0)
-
+            # ------------------------------
+            # UPDATE STEP
+            # ------------------------------
+            if is_update_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.cuda.synchronize(device=None)
+                optim_step_tic = time.perf_counter()
                 optim.step()
                 scheduler.step()
-                global_update += 1
+                torch.cuda.synchronize(device=None)
+                optim_step_time = time.perf_counter() - optim_step_tic
 
-                norm_mean = torch.tensor([accum_norm], device=device)
-                dist.all_reduce(norm_mean, op=dist.ReduceOp.AVG)   # average across ranks
-                sync_loss = norm_mean.item()
-                epoch_loss_sum += sync_loss
+                global_update += 1
                 num_updates += 1
 
-                # sums over accumulation window on this rank
-                mse_sum = torch.tensor([accum_mse], device=device)
-                lpips_sum = torch.tensor([accum_lpips], device=device)
-                raw_sum = torch.tensor([accum_raw_loss], device=device)
-
-                dist.all_reduce(mse_sum, op=dist.ReduceOp.AVG)
-                dist.all_reduce(lpips_sum, op=dist.ReduceOp.AVG)
-                dist.all_reduce(raw_sum, op=dist.ReduceOp.AVG)
-
-                mse_sum = mse_sum.item()
-                lpips_sum = lpips_sum.item()
-                raw_sum = raw_sum.item()
-
-                mse_mean = mse_sum / GRAD_ACCUM_STEPS
-                lpips_mean = lpips_sum / GRAD_ACCUM_STEPS
-                raw_mean = raw_sum / GRAD_ACCUM_STEPS
-
-                if rank == 0:
-                    # Sums over micro-batches in this update
-                    tb_writer.add_scalar("train/mse_mean", mse_mean, global_update)
-                    tb_writer.add_scalar("train/lpips_mean", lpips_mean, global_update)
-                    tb_writer.add_scalar("train/raw_loss_mean", raw_mean, global_update)
-                    tb_writer.add_scalar("train/normalized_loss_mean", sync_loss, global_update)
-                    current_lr = scheduler.get_last_lr()[0]
-                    tb_writer.add_scalar("train/lr", current_lr, global_update)
-
-                # Checkpoint every N updates (within epoch)
-                if global_update % CHECKPOINT_EVERY_N_UPDATES == 0:
-                    if rank == 0:
-                        print(f"[Checkpoint] Saving at global_update={global_update}")
-                    save_checkpoint(
-                        ckpt_path=ckpt_path,
-                        epoch=epoch,
-                        global_update=global_update,
-                        enc=enc,
-                        dec=dec,
-                        optim=optim,
-                        scheduler=scheduler,
-                        rms_norm=rms_norm,
-                        rank=rank,
-                        wandb_run_id=wandb_run_id,
-                        log_dir=log_dir,
+                # ————— Sync every LOG_INTERVAL —————
+                if global_update % 100 == 0:
+                    metrics = torch.tensor(
+                        [accum_norm, accum_mse, accum_lpips, accum_raw_loss],
+                        device=device,
+                        dtype=torch.float32,
                     )
+                    dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
+                    sync_loss, mse_sum, lpips_sum, raw_sum = metrics.tolist()
 
-                # Reset accumulators for next accumulation window
-                accum_mse = 0.0
-                accum_lpips = 0.0
-                accum_raw_loss = 0.0
-                accum_norm = 0.0
+                    epoch_loss_sum += sync_loss
+                    torch.cuda.synchronize(device=None)
+                    step_end = time.perf_counter()
+                    if rank == 0:
+                        mse_mean = mse_sum / GRAD_ACCUM_STEPS
+                        lpips_mean = lpips_sum / GRAD_ACCUM_STEPS
+                        raw_mean = raw_sum / GRAD_ACCUM_STEPS
 
-            torch.cuda.synchronize(device)
+                        tb_writer.add_scalar("train/mse_mean", mse_mean, global_update)
+                        tb_writer.add_scalar("train/lpips_mean", lpips_mean, global_update)
+                        tb_writer.add_scalar("train/raw_loss_mean", raw_mean, global_update)
+                        tb_writer.add_scalar("train/normalized_loss_mean", sync_loss, global_update)
+                        tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_update)
+                        tb_writer.add_scalar("timing/forward_time", forward_time, global_update)
+                        tb_writer.add_scalar("timing/backward_time", backward_time, global_update)
+                        tb_writer.add_scalar("timing/optim_step_time", optim_step_time, global_update)
+                        tb_writer.add_scalar("timing/overall_step_time", step_end - step_start, global_update)
+                        tb_writer.add_scalar("timing/data_time", data_time, global_update)
+
+                # Reset accumulators
+                accum_mse = accum_lpips = accum_raw_loss = accum_norm = 0.0
+
+            # ------------------------------
+            # End-of-step timing
+            # ------------------------------
+            torch.cuda.synchronize(device=None)
             step_end = time.perf_counter()
-            step_time = step_end - step_start
-            step_times.append(step_time)
+            step_times.append(step_end - step_start)
 
-            # Next data timing starts now (time until next batch is yielded)
+            # Next data load timing begins
+            torch.cuda.synchronize(device=None)
             data_start = time.perf_counter()
 
+
             # Print progress every 200 steps
-            if rank == 0 and is_last_micro and (global_update % 200 == 0):
-                avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
-                avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
+            # if rank == 0 and is_update_step and (global_update % 200 == 0):
+            #     avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
+            #     avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
+            #     frames_per_step = BATCH_PER_GPU * CONTEXT_T * world_size
+            #     step_fps = frames_per_step / avg_step_time
+            #     data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
+            #     print(
+            #         f"Epoch {epoch+1}/{NUM_EPOCHS} | "
+            #         f"Step {step_idx+1}/{STEPS_PER_EPOCH} | "
+            #         f"Loss: {sync_loss:.6f} | "
+            #         f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
+            #         f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
+            #     )
 
-                frames_per_step = BATCH_PER_GPU * CONTEXT_T * world_size
-                step_fps = frames_per_step / avg_step_time
-                data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
-                print(
-                    f"Epoch {epoch+1}/{NUM_EPOCHS} | "
-                    f"Step {step_idx+1}/{STEPS_PER_EPOCH} | "
-                    f"Loss: {sync_loss:.6f} | "
-                    f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
-                    f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
-                )
+
+
 
         epoch_end = time.perf_counter()
         epoch_time = epoch_end - epoch_start
-
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
         total_frames = BATCH_PER_GPU * CONTEXT_T * world_size * STEPS_PER_EPOCH
@@ -842,8 +759,7 @@ def main(cfg: DictConfig):
             ckpt_path=ckpt_path,
             epoch=epoch,
             global_update=global_update,
-            enc=enc,
-            dec=dec,
+            model = model,
             optim=optim,
             scheduler=scheduler,
             rms_norm=rms_norm,
@@ -880,7 +796,6 @@ def main(cfg: DictConfig):
             print(f"  Epoch {i+1}: Loss={epoch_losses[i]:.6f}, "
                   f"Time={epoch_times[i]:.2f}s, FPS={epoch_fps[i]:.2f}")
         print(f"{'='*60}")
-    
     # Cleanup
     cleanup_distributed()
     if rank == 0:

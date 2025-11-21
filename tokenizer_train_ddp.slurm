@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=dreamer_v4_multinode
-#SBATCH --nodes=3                          # 2 nodes
+#SBATCH --job-name=dreamer_v4_multinode_ddp
+#SBATCH --nodes=1                          # 2 nodes
 #SBATCH --ntasks-per-node=8                # 8 tasks (GPUs) per node
 #SBATCH --gres=gpu:8                       # 8 GPUs per node
 #SBATCH --constraint='h200'
@@ -95,5 +95,5 @@ srun singularity exec --nv \
     bash -c "
         source /ext3/env.sh
         conda activate dreamerv4
-        python tokenizer_train_fsdp.py
+        python tokenizer_train_ddp.py
     "

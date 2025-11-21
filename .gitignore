@@ -210,3 +210,4 @@ outputs
 checkpoints
 hpc
 tokenizer_ckpts
+wandb

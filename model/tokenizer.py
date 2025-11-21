@@ -76,7 +76,7 @@ class CausalTokenizerEncoder(nn.Module):
         self.register_buffer("temporal_mask_full", temporal_mask_full)
 
         # Project to latent_dim (typically < model_dim)
-        self.output_proj = nn.Linear(cfg.model_dim, cfg.latent_dim, bias=False)
+        self.output_proj = nn.Linear(cfg.model_dim, cfg.latent_dim)
         self.output_nonlinearity = nn.Tanh()
 
     def forward(self, x: torch.Tensor, causal: bool = True):
@@ -174,7 +174,7 @@ class CausalTokenizerDecoder(nn.Module):
         self.register_buffer("temporal_mask_full", temporal_mask_full)
 
         # Project latents from latent_dim → model_dim
-        self.input_proj = nn.Linear(cfg.latent_dim, cfg.model_dim, bias = False)
+        self.input_proj = nn.Linear(cfg.latent_dim, cfg.model_dim)
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         """
@@ -193,12 +193,12 @@ class CausalTokenizerDecoder(nn.Module):
             f"Temporal dimension {T} exceeds max_seq_len {self.max_seq_len}"
 
         # Project latents to model_dim
-        x_proj = self.input_proj(x)  # (B, T, N_latent, D_model)
+        x = self.input_proj(x)  # (B, T, N_latent, D_model)
 
         # Prepend learned modality tokens
         # learned_modality_tokens: (1, 1, S_mod, D_model) -> (B, T, S_mod, D_model)
         modality_tokens = self.learned_modality_tokens.expand(B, T, -1, -1)
-        atn_input = torch.cat([modality_tokens, x_proj], dim=2)  # (B, T, S_mod + N_latent, D_model)
+        x = torch.cat([modality_tokens, x], dim=2)  # (B, T, S_mod + N_latent, D_model)
 
         # Temporal mask
         if causal:
@@ -210,11 +210,11 @@ class CausalTokenizerDecoder(nn.Module):
 
         # Transformer stack
         for layer in self.layers:
-            atn_output = layer(atn_input, temporal_mask=temporal_mask, spatial_mask=spatial_mask)
+            x = layer(x, temporal_mask=temporal_mask, spatial_mask=spatial_mask)
 
         # Return only the decoded modality tokens (drop the latent positions)
         S_mod = self.cfg.num_modality_tokens
-        return atn_output[:, :, :S_mod, :]   # (B, T, S_mod, D_model)
+        return x[:, :, :S_mod, :]   # (B, T, S_mod, D_model)
 
 class ImagePatchifier(nn.Module):
     """

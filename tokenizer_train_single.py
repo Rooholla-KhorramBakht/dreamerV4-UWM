@@ -13,6 +13,7 @@ from model.tokenizer import (CausalTokenizerDecoder,
                              CausalTokenizerEncoder, 
                              CausalTokenizerConfig, 
                              TokensToImageHead, 
+                             LinearTokensToImageHead,
                              ImagePatchifier)
 from model.utils import TokenMasker
 import torch.optim as optim
@@ -101,7 +102,7 @@ class ModelWrapper(nn.Module):
         self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
-        self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
+        self.image_head = LinearTokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
         self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
 
     def forward(self, images):
@@ -211,15 +212,16 @@ def main(cfg: DictConfig):
     for epoch in range(cfg.train.num_epochs):
         for batch in train_loader:
             step += 1
-            ctx_len = torch.randint(1, cfg.tokenizer.max_context_length,(1,)).item()
-            # ctx_len = 1
+            # ctx_len = torch.randint(1, cfg.tokenizer.max_context_length,(1,)).item()
+            ctx_len = -1
             imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
             if cfg.augmentation.enable:
                 B, T, C, H, W = imgs.shape
                 imgs = imgs.view(B*T, C, H, W).contiguous().to(device)      # flatten time
                 imgs = augmentor(imgs) 
                 imgs = imgs.view(B, T, C, H, W).to(torch.float32)     # restore shape
-
+            
+            torch.compiler.cudagraph_mark_step_begin()
             optimizer.zero_grad()
             model.train()
             for _ in range(cfg.train.accum_grad_steps):
@@ -295,7 +297,7 @@ def main(cfg: DictConfig):
                         test_iter = iter(test_loader)
                         test_batch = next(test_iter)
 
-                    test_imgs = test_batch['observation.image'].to(torch.float32).to(device)[:,:16,...]
+                    test_imgs = test_batch['observation.image'].to(torch.float32).to(device)#[:,:16,...]
                     B, T, C, H, W = test_imgs.shape
 
                     recon = model(test_imgs)               # (B, T, C, H, W)

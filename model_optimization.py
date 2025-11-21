@@ -38,7 +38,8 @@ def main(cfg: DictConfig):
     # Instantiate the model
     model = ModelWrapper(cfg)
     model.to(device)
-    model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    # model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    model = torch.compile(model, mode="max-autotune", fullgraph=True)
 
     num_params = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     print(f"Number of encoder parameters (M): {num_params/1e6:.2f}M")
