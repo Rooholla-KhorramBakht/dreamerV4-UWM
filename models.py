@@ -685,7 +685,7 @@ class BlockCausalDynamicsLayer(nn.Module):
         self.d_model = d_model
         self.temporal = temporal
         
-        self.norm1 = nn.RMSNorm(d_model)
+        self.norm1 = nn.RMSNorm(d_model, eps=1e-6)
         # Dynamics has a single stream of tokens, so we use Self-Attention (Hq=Hkv)
         self.attn = MHA_GQA(
             d_model=d_model,
@@ -696,7 +696,7 @@ class BlockCausalDynamicsLayer(nn.Module):
             max_seq_len=seq_len if temporal else num_tokens
         )
         
-        self.norm2 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model, eps=1e-6)
         self.ffn = FeedForwardSwiGLU(d_model, int(d_model * mlp_ratio * 2 / 3), dropout=dropout)
         
         self.dropout = nn.Dropout(dropout)
@@ -749,7 +749,7 @@ class DreamerV4Dynamics(nn.Module):
         temporal_every: int = 4       # Apply temporal attention every K layers
     ):
         super().__init__()
-        num_step_levels = int(np.log2(num_tau_levels))
+        num_step_levels = int(np.log2(num_tau_levels)) + 1
         self.num_latents = num_latents
         self.latent_dim = latent_dim
         self.d_model = d_model

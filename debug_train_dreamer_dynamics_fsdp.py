@@ -1,3 +1,4 @@
+import idr_torch
 import os
 import time
 import torch
@@ -30,13 +31,14 @@ from torch.utils.tensorboard import SummaryWriter
 import wandb
 import datetime
 import math
+from datetime import timedelta
+import numpy as np
 
 def save_checkpoint(
     ckpt_path: str,
     epoch: int,
     global_update: int,
-    enc: FSDP,
-    dec: FSDP,
+    dyn: FSDP,
     optim: torch.optim.Optimizer,
     scheduler,
     rank: int,
@@ -51,10 +53,8 @@ def save_checkpoint(
     # ALL RANKS must participate in this, even though only rank 0 gets the result
     full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
 
-    with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
-        enc_state = enc.state_dict()  # All ranks participate in gather
-    with FSDP.state_dict_type(dec, StateDictType.FULL_STATE_DICT, full_cfg):
-        dec_state = dec.state_dict()  # All ranks participate in gather
+    with FSDP.state_dict_type(dyn, StateDictType.FULL_STATE_DICT, full_cfg):
+        dyn_state = dyn.state_dict()  # All ranks participate in gather
 
     # Only rank 0 saves to disk
     if rank == 0:
@@ -63,8 +63,7 @@ def save_checkpoint(
         ckpt = {
             "epoch": epoch,
             "global_update": global_update,
-            "enc": enc_state,
-            "dec": dec_state,
+            "dyn": dyn_state,
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
             "wandb_run_id": wandb_run_id,
@@ -76,8 +75,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     ckpt_path: str,
-    enc: FSDP,
-    dec: FSDP,
+    dyn: FSDP,
     optim: torch.optim.Optimizer,
     scheduler,
     rank: int,
@@ -112,10 +110,8 @@ def load_checkpoint(
     # Load full enc/dec state dicts into FSDP models
     full_cfg = FullStateDictConfig(rank0_only=False, offload_to_cpu=True)
 
-    with FSDP.state_dict_type(enc, StateDictType.FULL_STATE_DICT, full_cfg):
-        enc.load_state_dict(ckpt["enc"])
-    with FSDP.state_dict_type(dec, StateDictType.FULL_STATE_DICT, full_cfg):
-        dec.load_state_dict(ckpt["dec"])
+    with FSDP.state_dict_type(dyn, StateDictType.FULL_STATE_DICT, full_cfg):
+        dyn.load_state_dict(ckpt["dyn"])
 
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])
@@ -135,6 +131,8 @@ def setup_distributed():
     SLURM sets these automatically when using srun with --ntasks-per-node.
     """
     # SLURM sets these environment variables automatically
+    rank = idr_torch.rank
+
     rank = int(os.environ['SLURM_PROCID'])           # Global rank
     local_rank = int(os.environ['SLURM_LOCALID'])    # Local rank on node
     world_size = int(os.environ['SLURM_NTASKS'])     # Total number of tasks
@@ -143,13 +141,15 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     
+
+    print(os.environ['MASTER_ADDR'], os.environ['MASTER_PORT'])
     # Initialize process group with NCCL backend
     # MASTER_ADDR and MASTER_PORT should be set in SLURM script
     dist.init_process_group(
         backend='nccl',
         init_method='env://',
         world_size=world_size,
-        rank=rank
+        rank=rank,
     )
     
     return rank, local_rank, world_size
@@ -165,28 +165,35 @@ def get_fsdp_wrap_policy():
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             BlockCausalDynamicsLayer,
+            BlockCausalEncoderLayer
         },
     )
 
-def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"):
+def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD",
+                     fp32_params=False):
     """Wrap model with FSDP for distributed training."""
-    # Mixed precision policy for H200
     if mixed_precision:
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
+        if fp32_params:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        else:
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
     else:
         mp_policy = None
-    
-    # Map string to ShardingStrategy enum
+
     strategy_map = {
         "FULL_SHARD": ShardingStrategy.FULL_SHARD,
         "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
         "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
     }
-    
+
     fsdp_model = FSDP(
         model,
         sharding_strategy=strategy_map[sharding_strategy],
@@ -197,7 +204,6 @@ def setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD"
         limit_all_gathers=True,
         use_orig_params=True,
     )
-    
     return fsdp_model
 
 def create_distributed_dataloader(
@@ -266,13 +272,15 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @torch.no_grad()
-def load_pretrained_tokenizer_encoder(ckpt_path: str, device: torch.device, enc_kwargs: dict):
+def load_pretrained_tokenizer_encoder(ckpt_path: str, device: torch.device, enc_kwargs: dict, compile):
     """
     Load pretrained DreamerV4Encoder from a tokenizer checkpoint and freeze it.
     Expects a checkpoint saved by your tokenizer script with key 'enc'.
     """
     enc = DreamerV4Encoder(**enc_kwargs).to(device)
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    if compile:
+        enc = torch.compile(enc, mode="max-autotune", fullgraph=False)
     enc_state = ckpt.get("enc", None)
     if enc_state is None:
         raise RuntimeError("Checkpoint missing 'enc' weights; provide a tokenizer ckpt saved by your tokenizer training script.")
@@ -283,7 +291,7 @@ def load_pretrained_tokenizer_encoder(ckpt_path: str, device: torch.device, enc_
         p.requires_grad_(False)
     return enc
 
-def sample_shortcut_batch(B, T, device, num_tau_levels):
+def sample_shortcut_batch(B, T, device, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels):
     """
     Samples (tau, d) parameters for Diffusion Forcing with Shortcut split.
     
@@ -298,21 +306,10 @@ def sample_shortcut_batch(B, T, device, num_tau_levels):
         tau_idxs: (B,T) long
         step_idxs: (B,T) long
     """
-    # 1. Determine Task based on Rank
-    if dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    else:
-        rank = 0
-        world_size = 1
-        
+    # 1. Determine Task based on micro_idx
     # First 75% flow matching, rest shortcut
-    cutoff = int(world_size * 0.75)
-    # Ensure at least one rank is shortcut if world_size > 1, else usually mixed (but here requested split)
-    if world_size > 1 and cutoff == world_size:
-        cutoff = world_size - 1
-        
-    is_flow_worker = (rank < cutoff)
+    cutoff = int(GRAD_ACCUM_STEPS * 0.75)
+    is_flow_worker = (micro_idx < cutoff)
     
     # 2. Dynamic Grid Constants
     # If num_tau_levels = 64, d_min_idx = 6 (corresponding to 1/64 step)
@@ -358,7 +355,7 @@ def sample_shortcut_batch(B, T, device, num_tau_levels):
     tau_vals = 1 - (tau_idxs.float() + 1.0) * d_vals
     
     # We need each noise level to be associated to a unique id
-    real_tau_idxs = int((tau_idxs+1)*(2**(d_min_idx-step_idxs)))-1
+    real_tau_idxs = ((tau_idxs+1)*(2**(d_min_idx-step_idxs))).long()-1
     return tau_vals, d_vals, real_tau_idxs, step_idxs
 
 def add_noise_flow_matching(z_clean, tau):
@@ -375,24 +372,19 @@ def add_noise_flow_matching(z_clean, tau):
     z_noisy = (1 - tau_ex) * eps + tau_ex * z_clean
     return z_noisy
 
-def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idxs, step_idxs, num_tau_levels):
+def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idxs, step_idxs, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels):
     """
     Computes combined Flow Matching + Shortcut Loss.
     Determines Flow vs Shortcut based on Rank (same logic as sampler).
     """
-    # 1. Re-determine Task based on Rank
-    if dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    else:
-        rank = 0
-        world_size = 1
-        
-    cutoff = int(world_size * 0.75)
-    if world_size > 1 and cutoff == world_size:
-        cutoff = world_size - 1
-        
-    is_flow_worker = (rank < cutoff)
+    B, T, N, D = z_clean.shape
+
+    tau_vals = tau_vals.to(dtype=z_clean.dtype)
+    d_vals = d_vals.to(dtype=z_clean.dtype)
+
+    # 1. Re-determine Task based on micro_idx
+    cutoff = int(GRAD_ACCUM_STEPS * 0.75)
+    is_flow_worker = (micro_idx < cutoff)
     d_min_idx = int(np.log2(num_tau_levels))
     
     # 2. Create Noisy Input
@@ -417,8 +409,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
         diff = pred_z1_student - z_clean
         # Weighted MSE
         loss_flow = (weights * (diff ** 2)).mean()
-        return loss_flow, loss_flow, 0.0
-        
+        return loss_flow, loss_flow.detach().item(), 0.0
     else:
         # --- Shortcut Loss (d > d_min) ---
         # This worker is dedicated to Shortcut logic.
@@ -447,11 +438,11 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
 
             # Velocity b' = (pred - z) / (1 - tau)
             # Prevent div by zero if tau=1 (though shortcut usually < 1)
-            denom_t1 = (1.0 - tau_vals.view(-1, 1, 1, 1) + 1e-6)
+            denom_t1 = (1.0 - tau_vals.view(B, T, 1, 1) + 1e-6)
             b_prime = (pred_z1_t1 - z_in_short) / denom_t1
 
             # Advance state: z' = z + b' * d/2
-            z_prime = z_in_short + b_prime * d_half.view(-1, 1, 1, 1)
+            z_prime = z_in_short + b_prime * d_half.view(B, T, 1, 1)
 
             # --- Teacher 2: Middle -> End ---
             # New tau = tau + d/2
@@ -468,7 +459,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
             )
 
             # Velocity b'' = (pred - z') / (1 - tau_new)
-            denom_t2 = (1.0 - tau_new_vals.view(-1, 1, 1, 1) + 1e-6)
+            denom_t2 = (1.0 - tau_new_vals.view(B, T, 1, 1) + 1e-6)
             b_double_prime = (pred_z1_t2 - z_prime) / denom_t2
 
             # Target Velocity
@@ -476,7 +467,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
 
             # target_update = (1 - tau) * v_target
             # This cancels out the denominator in the student's velocity term.
-            target_update = (1.0 - tau_vals.view(-1, 1, 1, 1)) * v_target
+            target_update = (1.0 - tau_vals.view(B, T, 1, 1)) * v_target
 
         # Student Loss
         # -------------------------------------------------
@@ -488,111 +479,7 @@ def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idx
         # Apply Ramp Weighting
         loss_shortcut = (weights * (diff ** 2)).mean()
 
-        return loss_shortcut, 0.0, loss_shortcut
-
-def compute_dynamics_loss(dyn_model, actions, z_clean, tau_vals, d_vals, tau_idxs, step_idxs, mask_flow, num_tau_levels):
-    """
-    Computes combined Flow Matching + Shortcut Loss.
-    """
-    device = z_clean.device
-
-    d_min_idx = int(np.log2(num_tau_levels))
-
-    # 1. Create Noisy Input (Diffusion Forcing)
-    # Each timestep is corrupted independently based on its specific tau
-    z_input = add_noise_flow_matching(z_clean, tau_vals)
-    
-    # 2. Student Prediction (Full Step d)
-    # Predicts clean z1 (x-prediction)
-    pred_z1_student = dyn_model(actions, z_input, tau_idxs, step_idxs)
-    
-    # --- A. Flow Matching Loss (d = d_min) ---
-    # Target: z_clean. Loss: MSE(pred_z1, z_clean)
-    loss_flow = 0.0
-    if mask_flow.any():
-        # Simple MSE on the clean prediction
-        # DreamerV4 Eq 7 case 1
-        diff = pred_z1_student[mask_flow] - z_clean[mask_flow]
-        loss_flow = (diff ** 2).mean()
-
-    # --- B. Shortcut Loss (d > d_min) ---
-    loss_shortcut = 0.0
-    mask_short = ~mask_flow
-    if mask_short.any():
-        # We need the Teacher Target: 2 half-steps
-        # This requires extra forward passes. We do this under no_grad.
-        with torch.no_grad():
-            # === Step 1: First Half Step ===
-            # Current state: z_input (z_tau)
-            # Params: tau, d_half = d/2
-            # Note: In the grid, column j+1 is d/2.
-            step_idxs_half = step_idxs[mask_short] + 1
-            tau_idxs_1 = tau_idxs[mask_short]
-
-            z_in_short = z_input[mask_short]
-            act_short = actions[mask_short]
-
-            # Teacher 1 prediction: f(z_tau, tau, d/2) -> hat_z1_prime
-            pred_z1_t1 = dyn_model(
-                act_short.unsqueeze(1),
-                z_in_short.unsqueeze(1),
-                tau_idxs_1.unsqueeze(1),
-                step_idxs_half.unsqueeze(1)
-            ).squeeze(1)
-
-            # Convert to velocity b' = (hat_z1_prime - z_tau) / (1 - tau)
-            tau_short = tau_vals[mask_short].view(-1, 1, 1)
-            b_prime = (pred_z1_t1 - z_in_short) / (1.0 - tau_short + 1e-6)
-
-            # Advance state: z' = z_tau + b' * (d/2)
-            d_half = d_vals[mask_short].view(-1, 1, 1) / 2.0
-            z_prime = z_in_short + b_prime * d_half
-
-            # === Step 2: Second Half Step ===
-            # New state: z'
-            # New tau: tau + d/2
-            # New step: d/2
-
-            tau_idxs_half_2 = tau_idxs_1 - int(2 ** (d_min_idx - step_idxs_half))
-
-            # Teacher 2 prediction: f(z', tau+d/2, d/2) -> hat_z1_prime2
-            pred_z1_t2 = dyn_model(
-                act_short.unsqueeze(1),
-                z_prime.unsqueeze(1),
-                tau_idxs_half_2.unsqueeze(1),
-                step_idxs_half.unsqueeze(1)
-            ).squeeze(1)
-            
-            # Velocity b'' = (hat_z1_prime2 - z') / (1 - (tau+d/2))
-            tau_new = tau_short + d_half
-            b_double_prime = (pred_z1_t2 - z_prime) / (1.0 - tau_new + 1e-6)
-            
-            # Target velocity: avg(b', b'')
-            v_target = (b_prime + b_double_prime) / 2.0
-            
-        # Student Velocity (calculated with gradients)
-        pred_z1_short = pred_z1_student[mask_short]
-        
-        # Loss: (1-tau)^2 * MSE(v_student, v_target)
-        # The (1-tau)^2 term cancels the denominator in velocity definition?
-        # So Loss = || (pred_z1_student - z_tau) - (1-tau)*v_target ||^2
-        target_step = (1.0 - tau_short) * v_target
-        diff = (pred_z1_short - z_in_short) - target_step
-        loss_shortcut = (diff ** 2).mean()
-
-    # 3. Ramp Loss Weighting
-    # w(tau) = 0.9*tau + 0.1
-    # We apply this weight to the final loss.
-    # Since we split by mask, we compute mean w(tau) for each part?
-    # Actually, usually applied per-element.
-    # Let's just combine and return.
-    
-    # Note: For simplicity in this FSDP loop, we sum the scalars.
-    # Ideally, we weight the tensor before mean().
-    # Let's refine the return to be correct.
-    
-    total_loss = loss_flow + loss_shortcut # Simplified scalar sum
-    return total_loss, loss_flow, loss_shortcut
+        return loss_shortcut, 0.0, loss_shortcut.detach().item()
 
 def main():
     # Setup distributed training
@@ -623,16 +510,22 @@ def main():
     TEMPORAL_EVERY = 4
     IN_CH = 3
     NUM_TAU_LEVELS = 128
+    NUM_REGISTERS = 4
+
+    D_MODEL_DYN = 2048
+    N_LAYERS_DYN = 32
+    HEADS_Q_DYN = 32
+    CONTEXT_T_DYN = 32 # 96
 
     # Tokenizer checkpoint (encoder-only used, frozen)
     TOKENIZER_CKPT = "./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt"  # path to a saved tokenizer ckpt
 
     # Batch size per GPU
     BATCH_PER_GPU = 1
-    T = CONTEXT_T
-    NUM_EPOCHS = 65
-    #STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
-    GRAD_ACCUM_STEPS = 10  # simulate batch size 10 per GPU
+    T = CONTEXT_T_DYN
+    NUM_EPOCHS = 5 # 65
+    #STEPS_PER_EPOCH = 100  # Limit steps per epoch for faster benchmarking
+    GRAD_ACCUM_STEPS = 4 # 10  # simulate batch size 10 per GPU
     effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
@@ -650,8 +543,8 @@ def main():
         patch_size=16,
         d_model=D_MODEL,
         n_layers=N_LAYERS,
-        num_heads_q=HEADS,
-        num_heads_kv_latent=HEADS,
+        num_heads_q=HEADS_Q,
+        num_heads_kv_latent=HEADS_KV_LATENT,
         seq_len=CONTEXT_T,
         mlp_ratio=MLP_RATIO,
         dropout=0.0,
@@ -661,11 +554,11 @@ def main():
         in_channels=3,
         mae_max_mask_prob=0.0,  # disabled at eval
     )
-    enc = load_pretrained_tokenizer_encoder(TOKENIZER_CKPT, device=device, enc_kwargs=enc_kwargs)
+    enc = load_pretrained_tokenizer_encoder(TOKENIZER_CKPT, device=device, enc_kwargs=enc_kwargs, compile=True)
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
-        data_dir="/scratch/ja5009/soar_data_sharded/",
-        window_size=CONTEXT_T,
+        data_dir="/lustre/fswork/projects/rech/ugb/uzp81xx/soar_data_sharded/",
+        window_size=CONTEXT_T_DYN,
         batch_size=BATCH_PER_GPU,
         rank=rank,
         world_size=world_size,
@@ -680,8 +573,8 @@ def main():
     )
 
     test_loader, test_sampler, test_dataset = create_distributed_dataloader(
-        data_dir="/scratch/ja5009/soar_data_sharded/",
-        window_size=CONTEXT_T,
+        data_dir="/lustre/fswork/projects/rech/ugb/uzp81xx/soar_data_sharded/",
+        window_size=CONTEXT_T_DYN,
         batch_size=BATCH_PER_GPU,
         rank=rank,
         world_size=world_size,
@@ -705,15 +598,14 @@ def main():
         action_dim=action_dim,
         num_latents=N_LATENTS,
         latent_dim=BOTTLENECK_D,
-        d_model=D_MODEL,
-        num_layers=N_LAYERS,
-        num_heads=HEADS,
+        d_model=D_MODEL_DYN,
+        num_layers=N_LAYERS_DYN,
+        num_heads=HEADS_Q_DYN,
         num_registers=NUM_REGISTERS,
-        seq_len=CONTEXT_T,
+        seq_len=CONTEXT_T_DYN,
         dropout=0.0,
         mlp_ratio=MLP_RATIO,
-        num_sigma_levels=NUM_SIGMA_LEVELS,
-        num_step_levels=NUM_STEP_LEVELS,
+        num_tau_levels=NUM_TAU_LEVELS,
         temporal_every=TEMPORAL_EVERY,
     ).to(device)
 
@@ -722,14 +614,16 @@ def main():
         learnable_params = sum(p.numel() for p in dyn.parameters() if p.requires_grad)
         print(f"Total learnable parameters: {learnable_params:,}")
 
-    if USE_COMPILE:
-        enc = torch.compile(enc, mode="max-autotune", fullgraph=False)
-        dyn = torch.compile(dyn, mode="max-autotune", fullgraph=False)
+    enc = setup_fsdp_model(enc, mixed_precision=True, sharding_strategy="FULL_SHARD")
+    # dynamics: FP32 params to avoid BF16-param / FP32-grad bug
+    dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="FULL_SHARD",
+                       fp32_params=False)
 
-    dyn = setup_fsdp_model(dyn, mixed_precision=True, sharding_strategy="FULL_SHARD")
+    #if USE_COMPILE:
+    #    dyn = torch.compile(dyn, mode="max-autotune", fullgraph=False)
 
     # Create optimizer
-    optim = torch.optim.AdamW(dyn.parameters(), lr=3e-4, weight_decay=0.01)
+    optim = torch.optim.AdamW(dyn.parameters(), lr=1e-4, weight_decay=0.1)
 
     steps_per_epoch = len(train_loader)
     STEPS_PER_EPOCH = steps_per_epoch
@@ -747,8 +641,7 @@ def main():
         # Try loading checkpoint BEFORE initializing W&B
         start_epoch, global_update, wandb_run_id, log_dir = load_checkpoint(
             ckpt_path=ckpt_path,
-            enc=enc,
-            dec=dec,
+            dyn=dyn,
             optim=optim,
             scheduler=scheduler,
             rank=rank,
@@ -763,7 +656,7 @@ def main():
         # Use stable log_dir if resuming, otherwise create new one
         if log_dir is None:
             now = datetime.datetime.now()
-            log_dir = f"./logs/dreamer_v4_tokenizer/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
+            log_dir = f"./logs/dreamer_v4_dynamics/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
             os.makedirs(log_dir, exist_ok=True)
             ckpt_path = os.path.join(log_dir, "latest.pt")
         else:
@@ -853,6 +746,24 @@ def main():
     epoch_fps = []
     epoch_data_times = []
 
+    def check_grad_dtype_hook(param_name, param_dtype):
+        def hook(grad):
+            if grad is not None and grad.dtype != param_dtype:
+                print(f"\n[!] CRITICAL DTYPE MISMATCH for {param_name}:")
+                print(f"    Parameter dtype: {param_dtype}")
+                print(f"    Gradient dtype:  {grad.dtype}")
+                # Raising error here forces the stack trace to show the exact backward point
+                raise RuntimeError(f"Gradient dtype {grad.dtype} != Param dtype {param_dtype} for {param_name}")
+        return hook
+
+    # Register hooks on all parameters (run this before training loop)
+    print("[*] Registering gradient dtype checks...")
+    for name, p in dyn.named_parameters():
+        if p.requires_grad:
+            # Register on the accumulated grad (post-backward)
+            p.register_post_accumulate_grad_hook(check_grad_dtype_hook(name, p.dtype))
+
+
     for epoch in range(start_epoch, NUM_EPOCHS):
         # --- TRAIN PHASE ---
         dyn.train()
@@ -874,6 +785,8 @@ def main():
         accum_total = 0.0
 
         for step_idx, batch in enumerate(train_loader):
+            #if step_idx > STEPS_PER_EPOCH:
+            #    break
             micro_idx = step_idx % GRAD_ACCUM_STEPS
             is_last_micro = (micro_idx == GRAD_ACCUM_STEPS - 1)
 
@@ -906,19 +819,21 @@ def main():
             B, T, _, _ = z_clean.shape
 
             tau_vals, d_vals, tau_idxs, step_idxs = sample_shortcut_batch(
-                B, T, device, num_tau_levels=NUM_TAU_LEVELS
+                B, T, device, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels=NUM_TAU_LEVELS
             )
-            loss, l_flow, l_short = compute_dynamics_loss(
-                dyn, actions, z_clean,
-                tau_vals, d_vals, tau_idxs, step_idxs, num_tau_levels=NUM_TAU_LEVELS
-            )
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss, l_flow, l_short = compute_dynamics_loss(
+                    dyn, actions, z_clean,
+                    tau_vals, d_vals, tau_idxs, step_idxs, micro_idx, GRAD_ACCUM_STEPS, num_tau_levels=NUM_TAU_LEVELS
+                )
 
             # Update accumulators (CPU scalars)
-            accum_flow += l_flow.detach().item()
-            accum_shortcut += l_short.detach().item()
+            accum_flow += l_flow
+            accum_shortcut += l_short
             accum_total += loss.detach().item()
 
-            loss = loss / grad_accum_steps
+            loss = loss / GRAD_ACCUM_STEPS
             loss.backward()
 
             # If this is the last micro-batch in the window, do optimizer step
@@ -964,8 +879,7 @@ def main():
                         ckpt_path=ckpt_path,
                         epoch=epoch,
                         global_update=global_update,
-                        enc=enc,
-                        dec=dec,
+                        dyn=dyn,
                         optim=optim,
                         scheduler=scheduler,
                         rank=rank,
@@ -991,7 +905,7 @@ def main():
                 avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
                 avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
-                frames_per_step = BATCH_PER_GPU * CONTEXT_T * world_size
+                frames_per_step = BATCH_PER_GPU * CONTEXT_T_DYN * world_size
                 step_fps = frames_per_step / avg_step_time
                 data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
@@ -1008,7 +922,7 @@ def main():
 
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
-        total_frames = BATCH_PER_GPU * CONTEXT_T * world_size * STEPS_PER_EPOCH
+        total_frames = BATCH_PER_GPU * CONTEXT_T_DYN * world_size * STEPS_PER_EPOCH
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 
@@ -1032,8 +946,7 @@ def main():
             ckpt_path=ckpt_path,
             epoch=epoch,
             global_update=global_update,
-            enc=enc,
-            dec=dec,
+            dyn=dyn,
             optim=optim,
             scheduler=scheduler,
             rank=rank,
