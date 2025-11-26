@@ -25,4 +25,4 @@ module load arch/h100
 module load miniforge/24.9.0
 conda activate sheeprl_h100
 
-python eval_dynamics.py --tokenizer_ckpt="./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt" --dynamics_ckpt="./logs/dreamer_v4_dynamics/2025-11-24_19-48-34/latest.pt"
+python eval_dynamics.py --tokenizer_ckpt="./logs/dreamer_v4_tokenizer/2025-11-18_08-12-02/latest.pt" --dynamics_ckpt="./logs/dreamer_v4_dynamics/2025-11-25_00-41-11/latest.pt"

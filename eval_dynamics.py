@@ -25,11 +25,12 @@ MLP_RATIO = 4.0
 TEMPORAL_EVERY = 4
 IN_CH = 3
 
-D_MODEL_DYN = 768
-N_LAYERS_DYN = 12
-HEADS_Q_DYN = 12
+D_MODEL_DYN = 2048
+N_LAYERS_DYN = 32
+HEADS_Q_DYN = 32
 NUM_REGISTERS = 4
 NUM_TAU_LEVELS = 128
+CONTEXT_T_DYN = 32
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -80,7 +81,7 @@ def load_dynamics(ckpt_path, action_dim, device):
     dyn = DreamerV4Dynamics(
         action_dim=action_dim, num_latents=N_LATENTS, latent_dim=BOTTLENECK_D,
         d_model=D_MODEL_DYN, num_layers=N_LAYERS_DYN, num_heads=HEADS_Q_DYN,
-        num_registers=NUM_REGISTERS, seq_len=CONTEXT_T, num_tau_levels=NUM_TAU_LEVELS,
+        num_registers=NUM_REGISTERS, seq_len=CONTEXT_T_DYN, num_tau_levels=NUM_TAU_LEVELS,
         temporal_every=TEMPORAL_EVERY
     ).to(device, dtype=torch.bfloat16).eval()
     #dyn = torch.compile(dyn)
@@ -170,7 +171,7 @@ def main():
     # 1. Load Data
     print(f"Setting up dataset from {args.data_dir}...")
     dataset = ShardedHDF5Dataset(
-        data_dir=args.data_dir, window_size=CONTEXT_T, stride=1, split="test",
+        data_dir=args.data_dir, window_size=CONTEXT_T_DYN, stride=1, split="test",
         train_fraction=0.9, split_seed=123
     )
     # Standard DataLoader (no distributed sampler needed for eval)
