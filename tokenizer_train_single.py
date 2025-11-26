@@ -13,7 +13,6 @@ from model.tokenizer import (CausalTokenizerDecoder,
                              CausalTokenizerEncoder, 
                              CausalTokenizerConfig, 
                              TokensToImageHead, 
-                             LinearTokensToImageHead,
                              ImagePatchifier)
 from model.utils import TokenMasker
 import torch.optim as optim
@@ -102,7 +101,7 @@ class ModelWrapper(nn.Module):
         self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
         self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
         self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
-        self.image_head = LinearTokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
+        self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
         self.masker = TokenMasker(cfg.tokenizer.model_dim, cfg.tokenizer.num_modality_tokens)
 
     def forward(self, images):
@@ -193,10 +192,13 @@ def main(cfg: DictConfig):
     print(f"Number of decoder parameters (M): {num_params/1e6:.2f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    N_steps = cfg.train.num_epochs*len(train_loader)
+    WARMUP_STEPS = N_steps * 0.02
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=4000,
-        num_training_steps=5000000,
+        num_warmup_steps=WARMUP_STEPS,
+        num_training_steps=N_steps,
         num_cycles=0.5
     )
     # RMS loss normalizer for tokenizer losses
@@ -224,42 +226,30 @@ def main(cfg: DictConfig):
             torch.compiler.cudagraph_mark_step_begin()
             optimizer.zero_grad()
             model.train()
-            for _ in range(cfg.train.accum_grad_steps):
-                if cfg.train.mixed_precision:           
-                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                        recon_images = model(imgs)
-                        mse = mse_loss_fn(recon_images, imgs)
-                else:
+
+            if cfg.train.mixed_precision:           
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
                     recon_images = model(imgs)
                     mse = mse_loss_fn(recon_images, imgs)
+            else:
+                recon_images = model(imgs)
+                mse = mse_loss_fn(recon_images, imgs)
 
+            with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    # 2) LPIPS perceptual loss expects images in [-1, 1]
-                    images_lpips = (imgs * 2.0) - 1.0          # [B, T, C, H, W] -> [-1,1]
+                    images_lpips = (imgs * 2.0) - 1.0        
                     x_hat_lpips = (recon_images * 2.0) - 1.0
-
-                    # LPIPS implementation expects shape [B', C, H, W]; flatten time into batch
                     B, T, C, H, W = images_lpips.shape
                     images_lpips_flat = images_lpips.view(B * T, C, H, W)
                     x_hat_lpips_flat = x_hat_lpips.view(B * T, C, H, W)
-
                     lpips_val = lpips_model(x_hat_lpips_flat, images_lpips_flat)
-                    # Some LPIPS implementations return shape [B']; take mean over batch
                     lpips_loss = lpips_val.mean()
 
-                # Pre-RMS total loss (for logging only): L_raw = mse + 0.2 * lpips
-                raw_loss = mse + 0.2 * lpips_loss
-                
-                #lp=lpips_loss_fn(recon_images.flatten(0,1), images.flatten(0,1)).mean()
-                #total_loss = mse + cfg.train.lpips_weight * lp
-                # 3) RMS loss normalization per term
-                mse_norm = rms_norm("mse", mse)
-                lpips_norm = rms_norm("lpips", lpips_loss)
-
-                # 4) Combined tokenizer loss: L = LMSE + 0.2 * LLPIPS
-                loss = (mse_norm + 0.2 * lpips_norm) / cfg.train.accum_grad_steps
-                # Backward pass
-                loss.backward()
+            raw_loss = mse + 0.2 * lpips_loss
+            mse_norm = rms_norm("mse", mse)
+            lpips_norm = rms_norm("lpips", lpips_loss)
+            loss = (mse_norm + 0.2 * lpips_norm)
+            loss.backward()
             
             if cfg.train.clip_grad_norm:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip_grad_norm)
