@@ -322,7 +322,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-@hydra.main(config_path="config", config_name="tokenizer_cfg2.yaml")
+@hydra.main(config_path="config", config_name="tokenizer_large_cfg1.yaml")
 def main(cfg: DictConfig):
     # Setup distributed training
     rank, local_rank, world_size = setup_distributed()
