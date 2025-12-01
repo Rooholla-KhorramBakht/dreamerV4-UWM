@@ -7,6 +7,45 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.checkpoint import checkpoint
 import numpy as np
 
+class KVCache:
+    """
+    Simple rolling buffer for KV caching.
+    """
+    def __init__(self, max_seq_len: int, batch_size: int, num_heads: int, head_dim: int, device: torch.device, dtype: torch.dtype):
+        self.max_seq_len = max_seq_len
+        self.curr_len = 0
+        # Preallocate buffers [B, H, S, D]
+        self.k_cache = torch.zeros(batch_size, num_heads, max_seq_len, head_dim, device=device, dtype=dtype)
+        self.v_cache = torch.zeros(batch_size, num_heads, max_seq_len, head_dim, device=device, dtype=dtype)
+
+    def update(self, k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        k_new, v_new: [B, H, S_new, D] (usually S_new=1)
+        Returns full concatenated history [B, H, S_total, D]
+        """
+        B, H, S_new, D = k_new.shape
+        
+        # If buffer is full, roll (shift left)
+        if self.curr_len + S_new > self.max_seq_len:
+            shift = (self.curr_len + S_new) - self.max_seq_len
+            self.k_cache = torch.roll(self.k_cache, shifts=-shift, dims=2)
+            self.v_cache = torch.roll(self.v_cache, shifts=-shift, dims=2)
+            self.curr_len -= shift
+            
+        # Insert new tokens
+        self.k_cache[:, :, self.curr_len : self.curr_len + S_new, :] = k_new
+        self.v_cache[:, :, self.curr_len : self.curr_len + S_new, :] = v_new
+        
+        self.curr_len += S_new
+        
+        # Return valid slice
+        return self.k_cache[:, :, :self.curr_len, :], self.v_cache[:, :, :self.curr_len, :]
+    
+    def reset(self):
+        self.curr_len = 0
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+
 # --------- Utilities ---------
 
 class FeedForward(nn.Module):
@@ -156,14 +195,48 @@ class MHA_GQA(nn.Module):
         v = v.transpose(-3, -2)  # [..., G, Skv, Dh]
         return k, v
 
-    def forward(self, q_src, kv_src, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False, q_position_ids: Optional[torch.Tensor] = None, kv_position_ids: Optional[torch.Tensor] = None):
+    def forward(self, q_src, kv_src, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False,
+                q_position_ids: Optional[torch.Tensor] = None, kv_position_ids: Optional[torch.Tensor] = None,
+                kv_cache: Optional[KVCache] = None, update_cache: bool = True):
         # Compute projections (handle arbitrary prefix)
         q = self._proj_q(q_src)  # [..., Hq, Sq, Dh]
         k, v = self._proj_kv(kv_src)  # [..., G, Skv, Dh]
 
-        # Apply RoPE to queries and keys (not values)
-        q = self._apply_rope(q, position_ids=q_position_ids)  # [..., Hq, Sq, Dh]
-        k = self._apply_rope(k, position_ids=kv_position_ids)  # [..., G, Skv, Dh]
+        # --- KV Caching Logic ---
+        if kv_cache is not None:
+            # If caching, we assume q_src is the *new* query (Sq=1) 
+            # and kv_src is the *new* KV (Skv=1)
+            
+            # Apply RoPE to the NEW k only
+            # NOTE: RoPE needs the correct absolute position index for the new token.
+            # The caller must pass correct kv_position_ids for the current step.
+            k = self._apply_rope(k, position_ids=kv_position_ids)
+            
+            if update_cache:
+                # Standard behavior: Add new keys to cache
+                k, v = kv_cache.update(k, v)
+            else:
+                # Read-only behavior: 
+                # We need to attend to [Cache, New_K].
+                # So we manually concat without updating the ring buffer.
+                
+                # 1. Retrieve existing cache
+                # cache_k: [B, H, S_curr, D]
+                cache_k = kv_cache.k_cache[:, :, :kv_cache.curr_len, :]
+                cache_v = kv_cache.v_cache[:, :, :kv_cache.curr_len, :]
+                
+                # 2. Concat with current step's K/V
+                # k: [B, H, 1, D] -> [B, H, S_curr + 1, D]
+                k = torch.cat([cache_k, k], dim=2)
+                v = torch.cat([cache_v, v], dim=2)
+            
+            # RoPE for Q (current step)
+            q = self._apply_rope(q, position_ids=q_position_ids)
+            
+        else:
+            # Standard behavior (uncached)
+            q = self._apply_rope(q, position_ids=q_position_ids)
+            k = self._apply_rope(k, position_ids=kv_position_ids)
 
         # --- QKNorm: ℓ2-normalize along head_dim, then scale Q by learnable g ---
         # Normalize per (head, position) vector across Dh
@@ -171,6 +244,11 @@ class MHA_GQA(nn.Module):
         k = F.normalize(k, p=2.0, dim=-1)
         # Apply scalar scale g to Q (equivalent to scaling logits by g)
         q = q * self.qk_scale"""
+
+        if q.shape[-2] == 1:
+             effective_causal = False
+        else:
+             effective_causal = is_causal
 
         # Merge prefix dims if >1 (e.g., [B, T, Hq, Sq, Dh] -> [B*T, Hq, Sq, Dh]) for Flash Attention 4D
         prefix_shape = q.shape[:-3]
@@ -183,7 +261,7 @@ class MHA_GQA(nn.Module):
             with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
                 out = F.scaled_dot_product_attention(
                     query=q, key=k, value=v,
-                    attn_mask=attn_mask, is_causal=is_causal,
+                    attn_mask=attn_mask, is_causal=effective_causal,
                     dropout_p=(self.dropout if self.training else 0.0),
                     enable_gqa=(self.G != self.Hq),
                     #scale=1.0,  # disable 1/sqrt(Dh) since QKNorm already controls scale
@@ -195,7 +273,7 @@ class MHA_GQA(nn.Module):
             with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
                 out = F.scaled_dot_product_attention(
                     query=q, key=k, value=v,
-                    attn_mask=attn_mask, is_causal=is_causal,
+                    attn_mask=attn_mask, is_causal=effective_causal,
                     dropout_p=(self.dropout if self.training else 0.0),
                     enable_gqa=(self.G != self.Hq),
                     #scale=1.0,
@@ -510,6 +588,10 @@ class BlockCausalDecoderLayer(nn.Module):
         self,
         R: torch.Tensor,  # [B, T, Np, d] patch readout tokens
         L: torch.Tensor,  # [B, T, Nl, d] projected latents
+        kv_cache_l: Optional[KVCache] = None,
+        kv_cache_r: Optional[KVCache] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        update_cache: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, Np, d = R.shape
         if not self.is_last:
@@ -531,39 +613,49 @@ class BlockCausalDecoderLayer(nn.Module):
             R_out = R_out + self.dropout(self.ffn_P(self.ln_P_ff(R_out)))
 
             return R_out, L_out
-        
-        def _forward_temporal(R, L):
-            # Faster (115 fps) but more RAM (41.71 GB)
-            """union_LP = torch.cat([L, R], dim=2)  # [B, T, Np + Nl, d]
-            union_LP = union_LP.permute(0, 2, 1, 3)  # [B, Np + Nl, T, d]
 
-            union_LP_att = self.attn_latent(self.ln_L_q(union_LP), self.ln_L_kv(union_LP), attn_mask=None, is_causal=True)
-            union_LP_out = union_LP + self.dropout(union_LP_att)
-            union_LP_out = union_LP_out + self.dropout(self.ffn_L(self.ln_L_ff(union_LP_out)))
+        def _forward_temporal(R, L, kv_cache_l, kv_cache_r, position_ids, update_cache):
+            # --- 1. Patch Stream (R) ---
+            B, T, Np, d = R.shape
+            R_flat = R.transpose(1, 2).reshape(B * Np, T, d) # [B*Np, T, d]
 
-            union_LP_out = union_LP_out.permute(0, 2, 1, 3)  # [B, T, Np + Nl, d]
-            L_out = union_LP_out[:, :, :Nl]
-            R_out = union_LP_out[:, :, Nl:]"""
+            R_att = self.attn_patch(
+                self.ln_P_q(R_flat),
+                self.ln_P_kv(R_flat),
+                is_causal=True,
+                kv_cache=kv_cache_r,
+                q_position_ids=position_ids,
+                kv_position_ids=position_ids,
+                update_cache=update_cache
+            )
 
-            # Slower (106 fps) but less RAM (37.59 GB)
-            R = R.permute(0, 2, 1, 3)  # [B, Np, T, d]
-
-            R_att = self.attn_patch(self.ln_P_q(R), self.ln_P_kv(R), attn_mask=None, is_causal=True)
-            R_out = R + self.dropout(R_att)
+            R_out = R_flat + self.dropout(R_att)
             R_out = R_out + self.dropout(self.ffn_P(self.ln_P_ff(R_out)))
-            R_out = R_out.permute(0, 2, 1, 3)  # [B, T, Np, d]
+            R_out = R_out.view(B, Np, T, d).transpose(1, 2) # Restore [B, T, Np, d]
 
+            # --- 2. Latent Stream (L) ---
             if not self.is_last:
-                L = L.permute(0, 2, 1, 3)  # [B, Nl, T, d]
-                L_att = self.attn_latent(self.ln_L_q(L), self.ln_L_kv(L), attn_mask=None, is_causal=True)
-                L_out = L + self.dropout(L_att)
+                _, _, Nl, _ = L.shape
+                L_flat = L.transpose(1, 2).reshape(B * Nl, T, d) # [B*Nl, T, d]
+
+                L_att = self.attn_latent(
+                    self.ln_L_q(L_flat),
+                    self.ln_L_kv(L_flat),
+                    is_causal=True,
+                    kv_cache=kv_cache_l,
+                    q_position_ids=position_ids,
+                    kv_position_ids=position_ids,
+                    update_cache=update_cache
+                )
+
+                L_out = L_flat + self.dropout(L_att)
                 L_out = L_out + self.dropout(self.ffn_L(self.ln_L_ff(L_out)))
-                L_out = L_out.permute(0, 2, 1, 3)  # [B, T, Nl, d]
+                L_out = L_out.view(B, Nl, T, d).transpose(1, 2) # Restore [B, T, Nl, d]
             else:
                 L_out = None
 
             return R_out, L_out
-        
+
         # Use checkpointing for training
         if self.training and False:
             if not self.temporal:
@@ -574,7 +666,7 @@ class BlockCausalDecoderLayer(nn.Module):
             if not self.temporal:
                 R_out, L_out = _forward_spatial(R, L)
             else:
-                R_out, L_out = _forward_temporal(R, L)
+                R_out, L_out = _forward_temporal(R, L, kv_cache_l, kv_cache_r, position_ids, update_cache)
 
         return R_out, L_out
 
@@ -674,6 +766,83 @@ class DreamerV4Decoder(nn.Module):
         x_hat = patches.view(B_, T_, self.H, self.W, self.C).permute(0,1,4,2,3).contiguous()  # [B,T,C,H,W]
         return R_dec, x_hat
 
+    def init_cache(self, batch_size: int, device: torch.device, max_seq_len: int):
+        """Initializes separate KV caches for Latent (L) and Patch (R) streams."""
+        self.caches_l = []
+        self.caches_r = []
+        
+        for layer in self.layers:
+            if layer.temporal:
+                # Cache L: Batch * Num_Latents sequences
+                cache_l = KVCache(
+                    max_seq_len=max_seq_len,
+                    batch_size=batch_size * self.Nl,
+                    num_heads=layer.attn_latent.Hq,
+                    head_dim=layer.attn_latent.Dh,
+                    device=device,
+                    dtype=self.up_proj.weight.dtype
+                ) if not layer.is_last else None
+                
+                # Cache R: Batch * Num_Patches sequences
+                cache_r = KVCache(
+                    max_seq_len=max_seq_len,
+                    batch_size=batch_size * self.Np,
+                    num_heads=layer.attn_patch.Hq,
+                    head_dim=layer.attn_patch.Dh,
+                    device=device,
+                    dtype=self.up_proj.weight.dtype
+                )
+                self.caches_l.append(cache_l)
+                self.caches_r.append(cache_r)
+            else:
+                self.caches_l.append(None)
+                self.caches_r.append(None)
+
+    def forward_step(self, Z: torch.Tensor, start_step_idx: int, update_cache: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Autoregressive forward that handles both single-step generation (T=1)
+        and multi-step prefilling (T>1).
+        
+        Z: [B, T, Nl, d_b]
+        """
+        B, T, Nl, d_b = Z.shape
+        
+        # 1. Project latents up to model width
+        L = self.up_proj(Z) # [B, T, Nl, d]
+        
+        # 2. Get readout tokens for the sequence length T
+        # Expand R0 to match the input time dimension T
+        R0 = self.readout_tokens[None, None, :, :].expand(B, T, self.Np, self.d).contiguous()
+        
+        # 3. Generate Position IDs for RoPE
+        # Create a range [start, start+1, ..., start+T-1]
+        # Shape [1, T] -> Broadcasts to [Batch * Tokens, T] inside MHA
+        pos_ids = torch.arange(start_step_idx, start_step_idx + T, device=Z.device, dtype=torch.long)
+        pos_ids = pos_ids.unsqueeze(0) 
+
+        R_dec, L_dec = R0, L
+        
+        # 4. Apply layers (Spatial layers handle T natively; Temporal layers use cache)
+        for i, layer in enumerate(self.layers):
+            if layer.temporal:
+                R_dec, L_dec = layer(
+                    R_dec, L_dec, 
+                    kv_cache_l=self.caches_l[i], 
+                    kv_cache_r=self.caches_r[i],
+                    position_ids=pos_ids,
+                    update_cache=update_cache
+                )
+            else:
+                R_dec, L_dec = layer(R_dec, L_dec)
+                
+        # 5. Output projection
+        patches = self.patch_head(R_dec).view(B, T, self.Np, self.P, self.P, self.C)
+        Hp, Wp = self.H // self.P, self.W // self.P
+        patches = patches.view(B, T, Hp, Wp, self.P, self.P, self.C).permute(0,1,2,4,3,5,6).contiguous()
+        x_hat = patches.view(B, T, self.H, self.W, self.C).permute(0,1,4,2,3).contiguous()
+        
+        return R_dec, x_hat
+
 class BlockCausalDynamicsLayer(nn.Module):
     """
     A single layer of the Dynamics Transformer.
@@ -701,7 +870,7 @@ class BlockCausalDynamicsLayer(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, kv_cache: Optional[KVCache] = None, position_ids: Optional[torch.Tensor] = None, update_cache=True):
         # x: (B, T, N, D)
         B, T, N, D = x.shape
         
@@ -712,7 +881,9 @@ class BlockCausalDynamicsLayer(nn.Module):
             # Temporal Attention: Independent per token index 'n', causal over 't'
             # Reshape to (B*N, T, D) to treat each token position as a separate sequence
             x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
-            x = self.attn(x, x, is_causal=True)
+            x = self.attn(x, x, is_causal=True, kv_cache=kv_cache, 
+                          q_position_ids=position_ids, kv_position_ids=position_ids,
+                          update_cache=update_cache)
             x = x.view(B, N, T, D).permute(0, 2, 1, 3)
         else:
             # Spatial Attention: Independent per timestep 't', dense over 'n'
@@ -838,6 +1009,71 @@ class DreamerV4Dynamics(nn.Module):
             
         # 4. Extract and Project Outputs
         # We only need the predictions corresponding to the latent tokens (the last Nl tokens)
+        out_z_tokens = x[:, :, -self.num_latents:, :]
+        pred_z = self.out_proj(out_z_tokens)
+        
+        return pred_z
+
+    def init_cache(self, batch_size: int, device: torch.device, max_seq_len: int = 96):
+        """Initializes KV caches for all temporal layers."""
+        self.caches = []
+        for layer in self.layers:
+            if layer.temporal:
+                # Temporal cache needs to store (Batch * Num_Tokens) streams
+                # Batch size for cache = B * num_tokens_per_step
+                cache_bs = batch_size * self.num_tokens_per_step
+                
+                cache = KVCache(
+                    max_seq_len=max_seq_len,
+                    batch_size=cache_bs,
+                    num_heads=self.layers[0].attn.Hq, # Assuming uniform heads
+                    head_dim=self.layers[0].attn.Dh,
+                    device=device,
+                    dtype=self.act_proj.weight.dtype
+                )
+                self.caches.append(cache)
+            else:
+                self.caches.append(None) # Spatial layers don't cache time
+
+    def forward_step(self, 
+                     action: torch.Tensor, 
+                     noisy_z: torch.Tensor, 
+                     sigma_idx: torch.Tensor, 
+                     step_idx: torch.Tensor,
+                     start_step_idx: int,  # Absolute position for RoPE
+                     update_cache: bool = True):
+        """
+        Autoregressive forward for a single timestep T=1.
+        Must call init_cache() before starting loop.
+        """
+        # Inputs are [B, 1, ...]
+        B, T, _, _ = noisy_z.shape
+        
+        # 1. Embeddings (Same as forward)
+        emb_act = self.act_proj(action).unsqueeze(2) # [B, 1, 1, D]
+        emb_sigma = self.sigma_embed(sigma_idx)
+        emb_step = self.step_embed(step_idx)
+        emb_noise = torch.cat([emb_sigma, emb_step], dim=-1).unsqueeze(2)
+        emb_reg = self.register_tokens.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
+        emb_z = self.z_proj(noisy_z)
+        
+        # Concatenate: [B, 1, N_total, D]
+        x = torch.cat([emb_act, emb_noise, emb_reg, emb_z], dim=2)
+        
+        # Position IDs for RoPE
+        # We need [T] indices starting from start_step_idx
+        # Shape [1, T] to broadcast over batch
+        pos_ids = torch.arange(start_step_idx, start_step_idx + T, device=x.device, dtype=torch.long)
+        pos_ids = pos_ids.unsqueeze(0) # [1, T]
+
+        # 2. Apply Layers with Caching
+        for i, layer in enumerate(self.layers):
+            if layer.temporal:
+                x = layer(x, kv_cache=self.caches[i], position_ids=pos_ids, update_cache=update_cache)
+            else:
+                x = layer(x)
+
+        # 3. Output
         out_z_tokens = x[:, :, -self.num_latents:, :]
         pred_z = self.out_proj(out_z_tokens)
         
