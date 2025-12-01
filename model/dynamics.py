@@ -43,11 +43,11 @@ class DreamerV4Denoiser(nn.Module):
     def __init__(self, cfg: DreamerV4DenoiserCfg):
         super().__init__()
         self.cfg = cfg
-        self.diffuion_embedder = DiscreteEmbedder(cfg.K_max, cfg.model_dim//2)    
-        self.shortcut_embedder = DiscreteEmbedder(torch.log2(torch.tensor(cfg.K_max)).to(torch.long)+1, cfg.model_dim//2)    
+        self.diffuion_embedder = DiscreteEmbedder(cfg.K_max, cfg.model_dim)    
+        self.shortcut_embedder = DiscreteEmbedder(torch.log2(torch.tensor(cfg.K_max)).to(torch.long)+1, cfg.model_dim)    
         self.register_tokens = nn.Parameter(torch.zeros(1, 1, cfg.num_register_tokens, cfg.model_dim)) # 1 x 1 x N_reg x D
         self.action_tokens = nn.Parameter(torch.zeros(1, 1, cfg.num_action_tokens, cfg.model_dim))     # 1 x 1 x N_action x D
-        self.max_seq_len = cfg.max_context_length*1024
+        self.max_seq_len = max(cfg.num_action_tokens+cfg.num_latent_tokens+cfg.num_register_tokens+2, cfg.max_context_length)+32 # 32 is just a buffer to make sure things don't overflow
         self.layers = nn.ModuleList([
             EfficientTransformerBlock(
                 model_dim=cfg.model_dim,
@@ -61,6 +61,7 @@ class DreamerV4Denoiser(nn.Module):
         ])
         self.latent_projector = nn.Linear(cfg.latent_dim, cfg.model_dim, bias=False)
         self.output_projector = nn.Linear(cfg.model_dim, cfg.latent_dim, bias=False)
+        self.diff_control_proj = nn.Linear(cfg.model_dim*2, cfg.model_dim, bias=False)
 
     def forward(self, 
                 latent_tokens: torch.Tensor,    # BxTxN_latentxD
@@ -72,6 +73,7 @@ class DreamerV4Denoiser(nn.Module):
         diff_step_token = self.diffuion_embedder(diffusion_step).unsqueeze(-2) # BxTx1xD
         shortcut_token  = self.shortcut_embedder(shortcut_length).unsqueeze(-2) # BxTx1xD
         diff_control_token = torch.cat([shortcut_token, diff_step_token], dim=-1)
+        diff_control_token = self.diff_control_proj(diff_control_token)
 
         reg_tokens = self.register_tokens.expand(B, T, -1, -1)
         act_learned_tokens = self.action_tokens.expand(B, T, -1, -1)
@@ -97,7 +99,7 @@ class ForwardDiffusionWithShortcut(nn.Module):
         # half_step_idx = step_idx+1
         step = 1/2**step_idx
         # half_step = step/2 
-        noise_idx = torch.floor(torch.rand(*step.shape)*(step_idx**2).to(torch.float32))# <- Verify 
+        noise_idx = torch.floor((torch.rand(*step.shape)*0.9999)*(2**step_idx).to(torch.float32))# <- Verify 
         # noise_plus_halfstep_idx = noise_idx+half_step/self.d_min
         noise = noise_idx*step
         # noise_plus_halfstep = noise_plus_halfstep_idx*self.d_min
@@ -116,6 +118,7 @@ class ForwardDiffusionWithShortcut(nn.Module):
         tau_disc = (diff_params['tau'])/self.d_min
         half_d_disc = d_disc+1
         tau_plus_half_step_disc = (diff_params['tau']+diff_params['d']/2)/self.d_min
+        tau_plus_half_step = (diff_params['tau']+diff_params['d']/2)
         # shortcut_mask = diff_params['d'] > self.d_min
         # no_shortcut_mask = diff_params['d'] == self.d_min
         # with torch.no_grad():
@@ -128,8 +131,8 @@ class ForwardDiffusionWithShortcut(nn.Module):
         return dict(x_tau=x_tau, 
                     tau_d=tau_disc, 
                     step_d=d_disc,
-                    tau_plus_half_d = tau_plus_half_step_disc, 
+                    tau_plus_half_step_d = tau_plus_half_step_disc, 
                     half_step_d = half_d_disc, 
                     tau = diff_params['tau'], 
-                    step = diff_params['d']
+                    step = diff_params['d'],
                     )

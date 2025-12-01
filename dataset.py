@@ -45,7 +45,15 @@ class SingleViewSequenceDataset(Dataset):
         # We only open once here to inspect shape & optionally load-to-RAM.
         with h5py.File(self.hd5_file_path, "r") as f:
             cam1 = f["cam1"]
-            self.len_traj, self.C, self.H, self.W = cam1.shape
+            if 'dreamer-tokens' in f:
+                self.tokens = f['dreamer-tokens']
+                T1, self.C, self.H, self.W = cam1.shape
+                T2 = self.tokens.shape[0]
+                self.len_traj = min(T1, T2)
+
+            else:
+                self.tokens = None
+                self.len_traj, self.C, self.H, self.W = cam1.shape
 
             if self.traj_len * self.rate > self.len_traj:
                 raise ValueError(
@@ -58,6 +66,8 @@ class SingleViewSequenceDataset(Dataset):
             if self.load_to_ram:
                 # Load everything once and convert to tensors
                 self.cam1 = torch.from_numpy(cam1[:]).float()          # (T, C, H, W)
+                if self.tokens is not None:
+                    self.tokens = torch.from_numpy(self.tokens[:]).float()          # (T, C, H, W)
                 self.actions = torch.from_numpy(f["actions"][:]).float()  # (T, A)
                 if self.has_states:
                     self.states = torch.from_numpy(f["states"][:]).float()  # (T, S)
@@ -67,6 +77,7 @@ class SingleViewSequenceDataset(Dataset):
         # For on-disk mode, we'll open lazily per worker in __getitem__.
         if not self.load_to_ram:
             self.cam1 = None
+            self.tokens = None
             self.actions = None
             self.states = None
             self._h5 = None  # will be opened lazily
@@ -114,6 +125,7 @@ class SingleViewSequenceDataset(Dataset):
         f = self._lazy_open_h5()
         cam1 = f["cam1"][sl]        # (traj_len, C, H, W)
         actions = f["actions"][sl]  # (traj_len, A)
+        tokens = f["dreamer-tokens"][sl] if "dreamer-tokens" in f else None
 
         imgs = torch.from_numpy(cam1).float()
         actions = torch.from_numpy(actions).float()
@@ -124,7 +136,7 @@ class SingleViewSequenceDataset(Dataset):
         else:
             states = torch.zeros_like(actions)
 
-        return imgs, actions, states
+        return imgs, actions, states, tokens
 
     def _get_from_ram(self, sl):
         """
@@ -132,11 +144,15 @@ class SingleViewSequenceDataset(Dataset):
         """
         imgs = self.cam1[sl]        # (traj_len, C, H, W)
         actions = self.actions[sl]  # (traj_len, A)
+        if self.tokens is not None:
+            tokens = self.tokens[sl]
+        else:
+            tokens = None
         if self.states is not None:
             states = self.states[sl]
         else:
             states = torch.zeros_like(actions)
-        return imgs, actions, states
+        return imgs, actions, states, tokens
 
     def __getitem__(self, idx: int):
         if idx < 0 or idx >= self.num_segments:
@@ -148,9 +164,9 @@ class SingleViewSequenceDataset(Dataset):
 
         # Read data either from RAM or from disk
         if self.load_to_ram:
-            imgs, actions, states = self._get_from_ram(sl)
+            imgs, actions, states, tokens = self._get_from_ram(sl)
         else:
-            imgs, actions, states = self._get_from_disk(sl)
+            imgs, actions, states, tokens = self._get_from_disk(sl)
 
         # Crop state/action dims to nu
         Dout = {
@@ -158,6 +174,9 @@ class SingleViewSequenceDataset(Dataset):
             "observation.state": states[:, : self.nu],                   # (T, nu)
             "action": actions[:, : self.nu],                             # (T, nu)
         }
+        if tokens is not None:
+            Dout["observation.tokens"] = tokens                         # (T, C, H, W)
+
         return Dout
     
     def close(self):

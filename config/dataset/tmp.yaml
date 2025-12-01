@@ -1,7 +1,8 @@
 dt: 0.2
 resolution: [256, 256]
-load_to_ram: false
-base_path: /scratch/rk4342/datasets/pushT/pusht-play-128
+target_resolution: [256, 256]
+load_to_ram: true
+base_path: /home/mim-server/datasets/pushT/224/
 train_sequences:
   - "episode_0.h5"
   - "episode_1.h5"
@@ -14,6 +15,8 @@ train_sequences:
   - "episode_8.h5"
   - "episode_9.h5"
   - "episode_10.h5"
+  - "episode_11.h5"
+  - "episode_12.h5"
 
 test_sequences:
   - "episode_11.h5"

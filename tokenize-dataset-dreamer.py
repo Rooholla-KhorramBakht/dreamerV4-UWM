@@ -13,11 +13,19 @@ from model.tokenizer import (CausalTokenizerDecoder,
 from model.utils import TokenMasker
 from pathlib import Path
 import h5py
+from torch.nn.functional import interpolate
+
 
 def load_checkpoint(ckpt_path, model, optimizer=None, scaler=None, scheduler=None):
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt["model"]
 
-    model.load_state_dict(ckpt["model"])
+    # Clean the keys (remove `_orig_mod.`)
+    clean_sd = {}
+    for k, v in sd.items():
+        new_k = k.replace("_orig_mod.", "")
+        clean_sd[new_k] = v
+    model.load_state_dict(clean_sd)
 
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -60,7 +68,7 @@ class ModelWrapper(nn.Module):
         z, _ = self.encoder(tokens)
         return z
 
-@hydra.main(config_path="config", config_name="tokenizer_small.yaml")
+@hydra.main(config_path="config", config_name="tokenizer_large_cfg1.yaml")
 def main(cfg: DictConfig):
     torch.set_float32_matmul_precision('high')
     device = cfg.train.device
@@ -75,29 +83,33 @@ def main(cfg: DictConfig):
     dataset_base_path = Path(cfg.dataset.base_path)
     for seq_file in cfg.dataset.train_sequences:
         print(f'Processing seq: {seq_file}')
-        dataset = SingleViewSequenceDataset(dataset_base_path/seq_file, cfg.tokenizer.max_context_length, load_to_ram=cfg.dataset.load_to_ram)
+        dataset = SingleViewSequenceDataset(dataset_base_path/seq_file, cfg.tokenizer.max_context_length, load_to_ram=cfg.dataset.load_to_ram, non_overlapping=True)
         dataloader = DataLoader(
             dataset,
             batch_size=1,
             num_workers=cfg.train.num_workers,
             pin_memory=True,
             persistent_workers=True,
-            shuffle=True,
+            shuffle=False,
         )
         tokens = []
         for batch in tqdm(dataloader):
-            ctx_len = -1
-            imgs = batch['observation.image'][:,:ctx_len, ... ].to(torch.float32).to(device)
+            imgs = batch['observation.image'].to(torch.float32).to(device)
+            B, T, C = imgs.shape[:3]
+            imgs = interpolate(imgs.flatten(0,1), tuple(cfg.dataset.target_resolution)).view(B, T, C, cfg.dataset.target_resolution[0], cfg.dataset.target_resolution[1])
             with torch.no_grad():
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
                     token = model.tokenize(imgs).to(torch.float32).cpu()
                     tokens.append(token.clone())
-        tokens = torch.concat(tokens, dim=0)
+        
+        tokens = torch.concat(tokens, dim=1).squeeze()
+        
         dataset.close() # Close the HD5 dataset before writing into it
+        breakpoint()
         with h5py.File(dataset_base_path/seq_file, 'a') as f:
             if "dreamer-tokens" in f:
                 del f["dreamer-tokens"]
-            dataset = f.create_dataset("dreamer-tokens", data=tokens.numpy(), chunks=(4, cfg.tokenizer.max_context_length-1, cfg.tokenizer.num_latent_tokens, cfg.tokenizer.latent_dim), compression="gzip")
+            dataset = f.create_dataset("dreamer-tokens", data=tokens.numpy(), chunks=(cfg.tokenizer.max_context_length, cfg.tokenizer.num_latent_tokens, cfg.tokenizer.latent_dim), compression="gzip")
 
 if __name__ == '__main__':
     main()

@@ -1,3 +1,4 @@
+#with QK and Dropout and with normalized output layer (49892) /scratch/rk4342/dreamer-v4/tokenizer_ckpts/2025-11-29_00-27-14
 defaults:
  - dataset: pushT
 
