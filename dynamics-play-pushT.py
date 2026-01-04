@@ -30,17 +30,11 @@ from joy import XBoxController
 CONFIG_PATH = "config"
 
 TOKENIZER_CONFIG_NAME = "tokenizer_large_cfg1.yaml"
-TOKENIZER_CKPT_PATH = (
-    "/home/mim-server/projects/rooholla/dreamer-v4/"
-    "tokenizer_ckpts/large/cfg2/19.pt"
-)
+TOKENIZER_CKPT_PATH = "/home/mim-server/projects/rooholla/dreamer-v4/checkpoints/tokenizer_ckpts/large/cfg2/19.pt"
+
 
 DYNAMICS_CONFIG_NAME = "dynamics_small.yaml"
-DYNAMICS_CKPT_PATH = (
-    "/home/mim-server/projects/rooholla/dreamer-v4/"
-    "dynamics_ckpts/2025-12-04_23-37-40/checkpoints/"
-    "checkpoint_step_0210444.pt"
-)
+DYNAMICS_CKPT_PATH = "/home/mim-server/projects/rooholla/dreamer-v4/checkpoints/dynamics_ckpts/2025-12-04_23-37-40/checkpoints/checkpoint_step_0271149.pt"
 
 PUSHT_EPISODE_PATH = "/home/mim-server/datasets/pushT/224/episode_0.h5"
 
@@ -338,6 +332,7 @@ def run_joystick_control_loop():
 
     print("Starting joystick-controlled DreamerV4 rollout...")
     for i in range(1000):
+        tic = time.time()
         # ---- Read joystick and update action buffer ----
         with torch.no_grad():
             # Roll the buffer
@@ -382,6 +377,8 @@ def run_joystick_control_loop():
         cv2.imshow("dreamerv4", img)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+        while(time.time()-tic < 0.2):
+            time.sleep(0.001)
 
     cv2.destroyAllWindows()
 
