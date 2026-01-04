@@ -206,4 +206,15 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 checkpoints
+logs
+outputs
+checkpoints
+hpc
+tokenizer_ckpts
+wandb
+old
+logs_fsdp
+logs_single
+tokenizer_ckpt_cfg1_old_masker
+fsdp_logs
 HPC
