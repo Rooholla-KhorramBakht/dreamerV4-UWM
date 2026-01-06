@@ -5,6 +5,7 @@ from typing import Optional
 from .blocks import EfficientTransformerBlock
 from .utils import create_temporal_mask, create_encoder_spatial_mask, create_decoder_spatial_mask
 from dataclasses import dataclass
+from omegaconf import DictConfig, OmegaConf
 import math
 
 @dataclass
@@ -363,3 +364,38 @@ class TokenMasker(nn.Module):
                 mask = torch.zeros(B, T, N, dtype=torch.bool, device=x.device)
 
         return x
+    
+
+class SingleStreamTokenizerWrapper(nn.Module):
+    def __init__(self, cfg:DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer)) 
+        self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
+        self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
+        self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
+        self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
+        self.masker = TokenMasker(cfg.tokenizer.model_dim)
+
+    def forward(self, images):
+        images = (images*2.)-1. # Translate the images in +-1 range
+        tokens = self.patchifier(images)
+        masked_tokens = self.masker(tokens)
+        z, _ = self.encoder(masked_tokens)
+        z_decoded = self.decoder(z)
+        recon_images = self.image_head(z_decoded)
+        # return  torch.clamp((recon_images + 1)/2., 0., 1.)
+        return (recon_images + 1)/2.
+    
+    def encode(self, images):
+        images = (images*2.)-1. # Translate the images in +-1 range
+        tokens = self.patchifier(images)
+        masked_tokens = self.masker(tokens)
+        z, _ = self.encoder(masked_tokens)
+        return z
+    
+    def decode(self, latents):
+        z_decoded = self.decoder(latents)
+        recon_images = self.image_head(z_decoded)
+        # return  torch.clamp((recon_images + 1)/2., 0., 1.)
+        return (recon_images + 1)/2.

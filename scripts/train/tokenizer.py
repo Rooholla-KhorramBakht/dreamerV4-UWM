@@ -4,6 +4,7 @@ import hydra
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -20,41 +21,16 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
-from model.tokenizer import (CausalTokenizerDecoder, 
-                             CausalTokenizerEncoder, 
-                             CausalTokenizerConfig, 
-                             TokensToImageHead, 
-                             ImagePatchifier)
-from model.blocks import EfficientTransformerLayer
-from model.utils import TokenMasker
+from dreamerv4.single_stream.tokenizer import SingleStreamTokenizerWrapper 
+from dreamerv4.single_stream.blocks import EfficientTransformerLayer
 
-from dataset import ShardedHDF5Dataset
+from dreamerv4.datasets import ShardedHDF5Dataset
+from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
 import lpips
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 import datetime
 import math
-
-class ModelWrapper(nn.Module):
-    def __init__(self, cfg:DictConfig):
-        super().__init__()
-        self.cfg = cfg
-        tokenizer_cfg = CausalTokenizerConfig(**OmegaConf.to_object(cfg.tokenizer)) 
-        self.encoder = CausalTokenizerEncoder(tokenizer_cfg)
-        self.decoder = CausalTokenizerDecoder(tokenizer_cfg)
-        self.patchifier = ImagePatchifier(cfg.tokenizer.patch_size, cfg.tokenizer.model_dim)
-        self.image_head = TokensToImageHead(cfg.tokenizer.model_dim, cfg.dataset.resolution, cfg.tokenizer.patch_size)
-        self.masker = TokenMasker(cfg.tokenizer.model_dim)
-
-    def forward(self, images):
-        images = (images*2.)-1. # Translate the images in +-1 range
-        tokens = self.patchifier(images)
-        masked_tokens = self.masker(tokens)
-        z, _ = self.encoder(masked_tokens)
-        z_decoded = self.decoder(z)
-        recon_images = self.image_head(z_decoded)
-        # return  torch.clamp((recon_images + 1)/2., 0., 1.)
-        return (recon_images + 1)/2.
 
 class RMSLossScaler:
     """
@@ -87,8 +63,6 @@ class RMSLossScaler:
         # Normalize current loss by running RMS; gradient flows only through value
         return value / rms
 
-
-# ToDo: Save the state dicts of the model modules independently
 def save_checkpoint(
     ckpt_path: str,
     epoch: int,
@@ -185,36 +159,6 @@ def load_checkpoint(
             print(f"Resuming log directory: {log_dir}")
 
     return start_epoch, global_update, wandb_run_id, log_dir
-
-def setup_distributed():
-    """
-    Initialize distributed process group using SLURM environment variables.
-    SLURM sets these automatically when using srun with --ntasks-per-node.
-    """
-    # SLURM sets these environment variables automatically
-    rank = int(os.environ['SLURM_PROCID'])           # Global rank
-    local_rank = int(os.environ['SLURM_LOCALID'])    # Local rank on node
-    world_size = int(os.environ['SLURM_NTASKS'])     # Total number of tasks
-    
-    # Set device for this process
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-    
-    # Initialize process group with NCCL backend
-    # MASTER_ADDR and MASTER_PORT should be set in SLURM script
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=world_size,
-        rank=rank
-    )
-    
-    return rank, local_rank, world_size
-
-def cleanup_distributed():
-    """Clean up distributed training."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 def get_fsdp_wrap_policy():
     """Define which layers to wrap with FSDP."""
@@ -322,12 +266,12 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-@hydra.main(config_path="config", config_name="tokenizer_large_cfg1.yaml")
+@record
+@hydra.main(config_path="../config", config_name="tokenizer/single_stream/soar", version_base=None)
 def main(cfg: DictConfig):
     # Setup distributed training
-    rank, local_rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}")
-    
+    rank, local_rank, world_size, device = setup_distributed()
+
     # LPIPS model (perceptual loss), kept outside FSDP and frozen
     # Initialize only on rank 0 to avoid concurrent downloads; broadcast to other ranks
     if rank == 0:
@@ -363,41 +307,24 @@ def main(cfg: DictConfig):
         print(f"MASTER_PORT: {os.environ.get('MASTER_PORT', 'not set')}")
     
     # Set random seed for reproducibility
-    torch.manual_seed(42 + rank)
-    
-    # Model hyperparameters
-    IMG_H, IMG_W = 256, 256
-    CONTEXT_T = 96
-    N_LATENTS = 512
-    BOTTLENECK_D = 16
-    D_MODEL = 1024
-    N_LAYERS = 16
-    HEADS_Q = 16
-    HEADS_KV_LATENT = 16
-    MLP_RATIO = 4.0
-    TEMPORAL_EVERY = 4
-    
+    torch.manual_seed(cfg.seed + rank)
+        
     # Batch size per GPU
-    BATCH_PER_GPU = 1
-    T = CONTEXT_T
-    NUM_EPOCHS = 65
+    T = cfg.tokenizer.max_context_length
     # STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
-    GRAD_ACCUM_STEPS = 4  # simulate batch size 10 per GPU
-    effective_global_batch = BATCH_PER_GPU * world_size * GRAD_ACCUM_STEPS
+    effective_global_batch = cfg.train.batch_per_gpu * world_size * cfg.train.grad_accum_steps
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
-
-    USE_COMPILE = True
-    CHECKPOINT_EVERY_N_UPDATES = 5000
 
     # Create models
     if rank == 0:
         print("Creating encoder and decoder models...")
     
-    model = ModelWrapper(cfg)
+    # Todo: Make it cofigurable with hydra
+    model = SingleStreamTokenizerWrapper(cfg)
     model.to(device)
 
-    if USE_COMPILE:
+    if cfg.train.use_compile:
         # Good starting config; you can try other modes later
         model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
@@ -411,33 +338,33 @@ def main(cfg: DictConfig):
         print("Wrapping models with FSDP...")
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
-        data_dir="/scratch/ja5009/soar_data_sharded/",
-        window_size=CONTEXT_T,
-        batch_size=BATCH_PER_GPU,
+        data_dir=cfg.dataset.data_dir,
+        window_size=cfg.tokenizer.max_context_length,
+        batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
         num_workers=4,
         stride=1,
-        seed=42,
+        seed=cfg.seed,
         split="train",
         train_fraction=0.9,
-        split_seed=123,   # controls which episodes go to train/test
+        split_seed=cfg.dataset.split_seed,   # controls which episodes go to train/test
         shuffle=True,
         drop_last=True,
     )
 
     test_loader, test_sampler, test_dataset = create_distributed_dataloader(
-        data_dir="/scratch/ja5009/soar_data_sharded/",
-        window_size=CONTEXT_T,
-        batch_size=BATCH_PER_GPU,
+        data_dir=cfg.dataset.data_dir,
+        window_size=cfg.tokenizer.max_context_length,
+        batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
         num_workers=4,
         stride=1,
-        seed=42,          # seed for sampler sharding (not for split itself)
+        seed=cfg.seed,          # seed for sampler sharding (not for split itself)
         split="test",
         train_fraction=0.9,
-        split_seed=123,   # must match train_dataset
+        split_seed=cfg.dataset.split_seed,   # must match train_dataset
         shuffle=False,    # evaluation: deterministic order
         drop_last=False,  # keep all test windows
     )
@@ -449,23 +376,17 @@ def main(cfg: DictConfig):
 
     steps_per_epoch = len(train_loader)
     STEPS_PER_EPOCH = steps_per_epoch
-    total_steps = NUM_EPOCHS * steps_per_epoch // GRAD_ACCUM_STEPS
+    total_steps = cfg.train.num_epochs * steps_per_epoch // cfg.train.grad_accum_steps
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
     # RMS loss normalizer for tokenizer losses
     rms_norm = RMSLossScaler(decay=0.99, eps=1e-8)
-
-    RESUME_TRAINING = False
-    wandb_run_id = None
-    log_dir = None
-    ckpt_path = None
-    start_epoch = 0
-    global_update = 0  # counts optimizer updates
-    if RESUME_TRAINING:
+    
+    if cfg.reload_checkpoint is not None:
         # Try loading checkpoint BEFORE initializing W&B
         start_epoch, global_update, wandb_run_id, log_dir = load_checkpoint(
-            ckpt_path=ckpt_path,
+            ckpt_path=cfg.reload_checkpoint,
             model= model,
             optim=optim,
             scheduler=scheduler,
@@ -473,73 +394,36 @@ def main(cfg: DictConfig):
             rank=rank,
             device=device,
         )
+        ckpt_path = os.path.join(log_dir, "latest.pt")
     else:
         if rank == 0:
             print("Not resuming from checkpoint, starting from scratch.")
+            wandb_run_id = cfg.wandb.run_id
+            start_epoch = 0
+            global_update = 0  # counts optimizer updates
+            os.makedirs(cfg.output_dir, exist_ok=True)
+            ckpt_path = os.path.join(cfg.output_dir, "latest.pt")
+            log_dir = cfg.output_dir
 
     # TensorBoard + wandb (rank 0 only)
     if rank == 0:
-        # Use stable log_dir if resuming, otherwise create new one
-        if log_dir is None:
-            now = datetime.datetime.now()
-            log_dir = f"./logs/dreamer_v4_tokenizer/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
-            os.makedirs(log_dir, exist_ok=True)
-            ckpt_path = os.path.join(log_dir, "latest.pt")
-        else:
-            # Resuming: reuse existing log_dir
-            print(f"Reusing log directory: {log_dir}")
-
         # Initialize W&B with resume logic
         if wandb_run_id is not None:
             # Resuming an existing run
             wandb.init(
-                project="dreamer-v4-tokenizer",
+                project=cfg.wandb.project,
                 id=wandb_run_id,
                 resume="must",  # or "must" if you want to error if run doesn't exist
-                config={
-                    "img_h": IMG_H,
-                    "img_w": IMG_W,
-                    "context_t": CONTEXT_T,
-                    "n_latents": N_LATENTS,
-                    "bottleneck_d": BOTTLENECK_D,
-                    "d_model": D_MODEL,
-                    "n_layers": N_LAYERS,
-                    "heads_q": HEADS_Q,
-                    "heads_kv_latent": HEADS_KV_LATENT,
-                    "mlp_ratio": MLP_RATIO,
-                    "temporal_every": TEMPORAL_EVERY,
-                    "batch_per_gpu": BATCH_PER_GPU,
-                    "grad_accum_steps": GRAD_ACCUM_STEPS,
-                    "lr": 1e-4,
-                    "weight_decay": 0.01,
-                    "use_compile": USE_COMPILE,
-                },
+                config= OmegaConf.to_container(cfg, resolve=True), 
                 sync_tensorboard=True,
                 dir=log_dir,
             )
         else:
             # Starting a new run
             wandb.init(
-                project="dreamer-v4-tokenizer",
-                name=f"run_nodes{world_size//8}_gpus{world_size}",
-                config={
-                    "img_h": IMG_H,
-                    "img_w": IMG_W,
-                    "context_t": CONTEXT_T,
-                    "n_latents": N_LATENTS,
-                    "bottleneck_d": BOTTLENECK_D,
-                    "d_model": D_MODEL,
-                    "n_layers": N_LAYERS,
-                    "heads_q": HEADS_Q,
-                    "heads_kv_latent": HEADS_KV_LATENT,
-                    "mlp_ratio": MLP_RATIO,
-                    "temporal_every": TEMPORAL_EVERY,
-                    "batch_per_gpu": BATCH_PER_GPU,
-                    "grad_accum_steps": GRAD_ACCUM_STEPS,
-                    "lr": 1e-4,
-                    "weight_decay": 0.01,
-                    "use_compile": USE_COMPILE,
-                },
+                project=cfg.wandb.project,
+                name=f"run_num_gpus{world_size}",
+                config=OmegaConf.to_container(cfg, resolve=True),
                 sync_tensorboard=True,
                 dir=log_dir,
             )
@@ -570,8 +454,8 @@ def main(cfg: DictConfig):
     epoch_losses = []
     epoch_fps = []
     epoch_data_times = []
-    
-    for epoch in range(start_epoch, NUM_EPOCHS):
+
+    for epoch in range(start_epoch, cfg.train.num_epochs):
         # --- TRAIN PHASE ---
         model.train()
         # CRITICAL: Set epoch for DistributedSampler to reshuffle data
@@ -592,8 +476,8 @@ def main(cfg: DictConfig):
         accum_norm = 0.0
 
         for step_idx, batch in enumerate(train_loader):
-            micro_idx = step_idx % GRAD_ACCUM_STEPS
-            is_last_micro = (micro_idx == GRAD_ACCUM_STEPS - 1)
+            micro_idx = step_idx % cfg.train.grad_accum_steps
+            is_last_micro = (micro_idx == cfg.train.grad_accum_steps - 1)
 
             # --- measure how long we waited for this batch to arrive ---
             data_end = time.perf_counter()
@@ -652,7 +536,7 @@ def main(cfg: DictConfig):
             lpips_norm = rms_norm("lpips", lpips_loss)
 
             # 4) Combined tokenizer loss: L = LMSE + 0.2 * LLPIPS
-            loss = (mse_norm + 0.2 * lpips_norm) / GRAD_ACCUM_STEPS
+            loss = (mse_norm + 0.2 * lpips_norm) / cfg.train.grad_accum_steps
             accum_norm = accum_norm + loss.detach().item()
 
             # Backward pass
@@ -686,9 +570,9 @@ def main(cfg: DictConfig):
                 lpips_sum = lpips_sum.item()
                 raw_sum = raw_sum.item()
 
-                mse_mean = mse_sum / GRAD_ACCUM_STEPS
-                lpips_mean = lpips_sum / GRAD_ACCUM_STEPS
-                raw_mean = raw_sum / GRAD_ACCUM_STEPS
+                mse_mean = mse_sum / cfg.train.grad_accum_steps
+                lpips_mean = lpips_sum / cfg.train.grad_accum_steps
+                raw_mean = raw_sum / cfg.train.grad_accum_steps
 
                 if rank == 0 and num_updates%100==0:
                     # Sums over micro-batches in this update
@@ -700,7 +584,7 @@ def main(cfg: DictConfig):
                     tb_writer.add_scalar("train/lr", current_lr, global_update)
 
                 # Checkpoint every N updates (within epoch)
-                if global_update % CHECKPOINT_EVERY_N_UPDATES == 0:
+                if global_update % cfg.save_every == 0:
                     if rank == 0:
                         print(f"[Checkpoint] Saving at global_update={global_update}")
                     save_checkpoint(
@@ -737,12 +621,12 @@ def main(cfg: DictConfig):
                 avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
                 avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
-                frames_per_step = BATCH_PER_GPU * CONTEXT_T * world_size
+                frames_per_step = cfg.train.batch_per_gpu * cfg.tokenizer.max_context_length * world_size
                 step_fps = frames_per_step / avg_step_time
                 data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
                 # print(
-                #     f"Epoch {epoch+1}/{NUM_EPOCHS} | "
+                #     f"Epoch {epoch+1}/{cfg.train.num_epochs} | "
                 #     f"Step {step_idx+1}/{STEPS_PER_EPOCH} | "
                 #     f"Loss: {sync_loss:.6f} | "
                 #     f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
@@ -754,7 +638,7 @@ def main(cfg: DictConfig):
 
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
-        total_frames = BATCH_PER_GPU * CONTEXT_T * world_size * STEPS_PER_EPOCH
+        total_frames = cfg.train.batch_per_gpu * cfg.tokenizer.max_context_length * world_size * STEPS_PER_EPOCH
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 
@@ -826,7 +710,7 @@ def main(cfg: DictConfig):
 
         if rank == 0:
             print(f"\n{'='*60}")
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS} Summary:")
+            print(f"Epoch {epoch+1}/{cfg.train.num_epochs} Summary:")
             print(f" Train Loss: {avg_loss:.6f}")
             print(f" Val Loss:   {avg_val_loss:.6f}")
             print(f"  Epoch Time: {epoch_time:.2f}s")
@@ -857,7 +741,7 @@ def main(cfg: DictConfig):
         print(f"\n{'='*60}")
         print("Training Complete!")
         print(f"{'='*60}")
-        print(f"Overall Statistics (across {NUM_EPOCHS} epochs):")
+        print(f"Overall Statistics (across {cfg.train.num_epochs} epochs):")
         print(f"  Average epoch time: {sum(epoch_times)/len(epoch_times):.2f}s")
         print(f"  Average loss: {sum(epoch_losses)/len(epoch_losses):.6f}")
         print(f"  Average FPS: {sum(epoch_fps)/len(epoch_fps):.2f}")
@@ -873,7 +757,7 @@ def main(cfg: DictConfig):
         
         # Per-epoch breakdown
         print(f"\nPer-Epoch Breakdown:")
-        for i in range(NUM_EPOCHS):
+        for i in range(cfg.train.num_epochs):
             print(f"  Epoch {i+1}: Loss={epoch_losses[i]:.6f}, "
                   f"Time={epoch_times[i]:.2f}s, FPS={epoch_fps[i]:.2f}")
         print(f"{'='*60}")

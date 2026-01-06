@@ -49,12 +49,34 @@ class RopeEmbedding(nn.Module):
         self.register_buffer('cos_emb', cos_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
         self.register_buffer('sin_emb', sin_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
 
+    # def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     B, H, T, d = q.shape
+        
+    #     # Slice with offset for inference
+    #     cos_emb = self.cos_emb[:, :, offset : offset + T, :]
+    #     sin_emb = self.sin_emb[:, :, offset : offset + T, :]
+        
+    #     q_odd, q_even = q[..., ::2], q[..., 1::2]
+    #     qJ = torch.stack([-q_even, q_odd], dim=-1).reshape_as(q)
+    #     k_odd, k_even = k[..., ::2], k[..., 1::2]
+    #     kJ = torch.stack([-k_even, k_odd], dim=-1).reshape_as(k)
+        
+    #     q_rot = (q * cos_emb) + (qJ * sin_emb)
+    #     k_rot = (k * cos_emb) + (kJ * sin_emb)
+    #     return q_rot, k_rot
     def forward(self, q: torch.Tensor, k: torch.Tensor, offset: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         B, H, T, d = q.shape
         
-        # Slice with offset for inference
-        cos_emb = self.cos_emb[:, :, offset : offset + T, :]
-        sin_emb = self.sin_emb[:, :, offset : offset + T, :]
+        # 1. Slice the buffers
+        # Note: slicing creates a 'view' that still points to the DDP-synced buffer memory
+        cos_view = self.cos_emb[:, :, offset : offset + T, :]
+        sin_view = self.sin_emb[:, :, offset : offset + T, :]
+        
+        # 2. CLONE them to break the dependency on the DDP buffer
+        # This ensures that if DDP syncs (overwrites) self.cos_emb later, 
+        # the graph uses this safe copy.
+        cos_emb = cos_view.clone()
+        sin_emb = sin_view.clone()
         
         q_odd, q_even = q[..., ::2], q[..., 1::2]
         qJ = torch.stack([-q_even, q_odd], dim=-1).reshape_as(q)

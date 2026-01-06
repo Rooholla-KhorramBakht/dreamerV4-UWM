@@ -1,3 +1,8 @@
+import math
+from typing import Optional, List
+import torch
+import torch.nn as nn
+from .single_stream.dynamics import DreamerV4Denoiser
 
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
     """
@@ -140,7 +145,6 @@ def apply_denoiser(
     x_tau: torch.Tensor,              # (B, T, N_lat, D_latent)
     tau_index: torch.Tensor,          # (B, T) long
     step_index: torch.Tensor,         # (B, T) long
-    discrete_actions: Optional[torch.Tensor] = None,    # (B, T, n_d)
     actions: Optional[torch.Tensor] = None,  # (B, T, n_c)
     no_grad: bool = False,
 ) -> torch.Tensor:
@@ -153,7 +157,6 @@ def apply_denoiser(
                 latent_tokens=x_tau,
                 diffusion_step=tau_index,
                 shortcut_length=step_index,
-                discrete_actions=discrete_actions,
                 actions=actions,
                 causal=True,
             )
@@ -162,7 +165,6 @@ def apply_denoiser(
             latent_tokens=x_tau,
             diffusion_step=tau_index,
             shortcut_length=step_index,
-            discrete_actions=discrete_actions,
             actions=actions,
             causal=True,
         )
@@ -175,7 +177,6 @@ def apply_denoiser(
 def compute_bootstrap_diffusion_loss(
     info: dict,
     denoiser: DreamerV4Denoiser,
-    discrete_actions: Optional[torch.Tensor] = None,     # (B, T, n_d)
     actions: Optional[torch.Tensor] = None,   # (B, T, n_c)
 ):
     """
@@ -217,7 +218,6 @@ def compute_bootstrap_diffusion_loss(
         x_tau,                 # (B, T, N_lat, D_lat)
         tau_index,             # (B, T)
         step_index,            # (B, T)
-        discrete_actions=discrete_actions,
         actions=actions,
         no_grad=False,
     )                           # -> (B, T, N_lat, D_lat)
@@ -253,7 +253,6 @@ def compute_bootstrap_diffusion_loss(
             x_tau,                  # (B, T, N_lat, D_lat)
             tau_index,              # (B, T)  use same τ
             half_step_index,        # (B, T)  d/2 index
-            discrete_actions=discrete_actions,
             actions=actions,
             no_grad=True,
         )                           # (B, T, N_lat, D_lat)
@@ -270,7 +269,6 @@ def compute_bootstrap_diffusion_loss(
             z_prime,                # (B, T, N_lat, D_lat)
             tau_plus_half_index,    # (B, T)  τ + d/2
             half_step_index,        # (B, T)  d/2
-            discrete_actions=discrete_actions,
             actions=actions,
             no_grad=True,
         )                           # (B, T, N_lat, D_lat)
