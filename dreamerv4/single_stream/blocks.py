@@ -64,8 +64,7 @@ class RopeEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048):
         super().__init__()
         self.dim = dim
-        # self.max_seq_len = max_seq_len
-        self.max_seq_len = 1024
+        self.max_seq_len = max_seq_len
         self.initialize_buffer(max_seq_len)
         
     def initialize_buffer(self, max_seq_len):
@@ -266,6 +265,9 @@ class Attention(nn.Module):
                 K = self.rope_embedder(K, position_ids=kv_position_ids)
                 # Q, K = self.rope_embedder(Q, K)
 
+        if is_causal:
+            assert mask is None, "Causal flag should not be set when mask is provided."
+        
         if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 Y = F.scaled_dot_product_attention(
@@ -575,8 +577,8 @@ class EfficientTransformerBlock(nn.Module):
                 cache = KVCache(
                     context_length=context_length,
                     batch_size=int(batch_size*self.modality_dim_max_seq_len),
-                    num_heads=int(self.n_heads),
-                    head_dim=int(self.model_dim//self.n_kv_heads),
+                    num_heads=int(self.n_kv_heads),
+                    head_dim=int(self.model_dim//self.n_heads),
                     device=device,
                     dtype=dtype
                 )

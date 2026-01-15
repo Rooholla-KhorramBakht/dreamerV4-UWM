@@ -381,7 +381,7 @@ class TokenizerWrapper(nn.Module):
         images = (images*2.)-1. # Translate the images in +-1 range
         tokens = self.patchifier(images)
         masked_tokens = self.masker(tokens)
-        z, _ = self.enc(masked_tokens)
+        z, _ = self.encoder(masked_tokens)
         z_decoded = self.decoder(z)
         recon_images = self.image_head(z_decoded)
         # return  torch.clamp((recon_images + 1)/2., 0., 1.)

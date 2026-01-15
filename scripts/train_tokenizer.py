@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
-from dreamerv4.single_stream.tokenizer import SingleStreamTokenizerWrapper 
+from dreamerv4.single_stream.tokenizer import TokenizerWrapper 
 from dreamerv4.single_stream.blocks import EfficientTransformerLayer
 
 from dreamerv4.datasets import ShardedHDF5Dataset
@@ -63,7 +63,7 @@ class RMSLossScaler:
         # Normalize current loss by running RMS; gradient flows only through value
         return value / rms
 
-def save_checkpoint(
+def save_fsdp_checkpoint(
     ckpt_path: str,
     epoch: int,
     global_update: int,
@@ -104,7 +104,7 @@ def save_checkpoint(
         torch.save(ckpt, ckpt_path)
         print(f"[rank0] Saved checkpoint to {ckpt_path}")
 
-def load_checkpoint(
+def load_fsdp_checkpoint(
     ckpt_path: str,
     model: FSDP,
     optim: torch.optim.Optimizer,
@@ -267,7 +267,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @record
-@hydra.main(config_path="../config", config_name="tokenizer/single_stream/soar", version_base=None)
+@hydra.main(config_path="config", config_name="tokenizer/single_stream/soar", version_base=None)
 def main(cfg: DictConfig):
     # Setup distributed training
     rank, local_rank, world_size, device = setup_distributed()
@@ -321,16 +321,15 @@ def main(cfg: DictConfig):
         print("Creating encoder and decoder models...")
     
     # Todo: Make it cofigurable with hydra
-    model = SingleStreamTokenizerWrapper(cfg)
-    model.to(device)
+    tokenizer = TokenizerWrapper(cfg)
+    tokenizer.to(device)
 
     if cfg.train.use_compile:
-        # Good starting config; you can try other modes later
         model = torch.compile(model, mode="max-autotune", fullgraph=False)
 
     # Print parameter counts
     if rank == 0:
-        learnable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        learnable_params = sum(p.numel() for p in tokenizer.parameters() if p.requires_grad)
         print(f"Total learnable parameters: {learnable_params:,}")
     
     # Wrap with FSDP
@@ -369,9 +368,9 @@ def main(cfg: DictConfig):
         drop_last=False,  # keep all test windows
     )
 
-    model = setup_fsdp_model(model, mixed_precision=True, sharding_strategy="FULL_SHARD")
+    tokenizer = setup_fsdp_model(tokenizer, mixed_precision=True, sharding_strategy="FULL_SHARD")
     # Create optimizer
-    params = model.parameters()
+    params = tokenizer.parameters()
     optim = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01) # try increasing to 0.03–0.05? (apparently normal range for tokenizer)
 
     steps_per_epoch = len(train_loader)
@@ -385,7 +384,7 @@ def main(cfg: DictConfig):
     
     if cfg.reload_checkpoint is not None:
         # Try loading checkpoint BEFORE initializing W&B
-        start_epoch, global_update, wandb_run_id, log_dir = load_checkpoint(
+        start_epoch, global_update, wandb_run_id, log_dir = load_fsdp_checkpoint(
             ckpt_path=cfg.reload_checkpoint,
             model= model,
             optim=optim,
@@ -457,7 +456,7 @@ def main(cfg: DictConfig):
 
     for epoch in range(start_epoch, cfg.train.num_epochs):
         # --- TRAIN PHASE ---
-        model.train()
+        tokenizer.train()
         # CRITICAL: Set epoch for DistributedSampler to reshuffle data
         train_sampler.set_epoch(epoch)
 
@@ -499,10 +498,9 @@ def main(cfg: DictConfig):
             # Forward pass
             # Zero grads at the start of each accumulation window
             if micro_idx == 0:
-                # torch.compiler.cudagraph_mark_step_begin()
                 optim.zero_grad(set_to_none=True)
 
-            x_hat = model(images)
+            x_hat = tokenizer(images)
 
             # --- Tokenizer reconstruction losses: MSE + 0.2 * LPIPS, with RMS normalization ---
 
@@ -545,7 +543,7 @@ def main(cfg: DictConfig):
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
                 #torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-                model.clip_grad_norm_(max_norm=1.0)
+                tokenizer.clip_grad_norm_(max_norm=1.0)
 
                 optim.step()
                 scheduler.step()
@@ -587,7 +585,7 @@ def main(cfg: DictConfig):
                 if global_update % cfg.save_every == 0:
                     if rank == 0:
                         print(f"[Checkpoint] Saving at global_update={global_update}")
-                    save_checkpoint(
+                    save_fsdp_checkpoint(
                         ckpt_path=ckpt_path,
                         epoch=epoch,
                         global_update=global_update,
@@ -625,13 +623,13 @@ def main(cfg: DictConfig):
                 step_fps = frames_per_step / avg_step_time
                 data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
-                # print(
-                #     f"Epoch {epoch+1}/{cfg.train.num_epochs} | "
-                #     f"Step {step_idx+1}/{STEPS_PER_EPOCH} | "
-                #     f"Loss: {sync_loss:.6f} | "
-                #     f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
-                #     f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
-                # )
+                print(
+                    f"Epoch {epoch+1}/{cfg.train.num_epochs} | "
+                    f"Step {step_idx+1}/{STEPS_PER_EPOCH} | "
+                    f"Loss: {sync_loss:.6f} | "
+                    f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
+                    f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
+                )
 
         epoch_end = time.perf_counter()
         epoch_time = epoch_end - epoch_start
@@ -649,7 +647,7 @@ def main(cfg: DictConfig):
 
         # --- TEST PHASE ---
         optim.zero_grad(set_to_none=True)
-        model.eval()
+        tokenizer.eval()
 
         # Even with shuffle=False, set_epoch is recommended for DistributedSampler
         test_sampler.set_epoch(epoch)
@@ -720,7 +718,7 @@ def main(cfg: DictConfig):
             print(f"  Avg Step Time: {sum(step_times)/len(step_times):.3f}s")
             print(f"{'='*60}\n")
 
-        save_checkpoint(
+        save_fsdp_checkpoint(
             ckpt_path=f"/scratch/rk4342/dreamer-v4/fsdp_logs/{epoch}.pt",
             epoch=epoch,
             global_update=global_update,
