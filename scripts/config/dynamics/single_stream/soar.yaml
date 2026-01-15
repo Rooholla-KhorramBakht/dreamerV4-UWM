@@ -4,7 +4,7 @@ defaults:
 
 dual_stream: false
 tokenizer_ckpt: /home/mim-server/projects/rooholla/dreamer-v4/checkpoints/tokenizer_ckpts/large/cfg2/19.pt
-dynamics_ckpt: /home/mim-server/projects/rooholla/dreamer-v4/checkpoints/dynamics_ckpts/single-stream-dynamics-soar.pt
+dynamics_ckpt: null #/home/mim-server/projects/rooholla/dreamer-v4/checkpoints/dynamics_ckpts/single-stream-dynamics-soar.pt
 reload_checkpoint: null
 output_dir: checkpoints/dynamics/soar/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
@@ -18,7 +18,7 @@ denoiser:
   num_action_tokens: 1    # Number of tokens for the image or other modalities
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
-  max_context_length: 32      # The maximum temporal horizon of the tokenizer
+  max_context_length: 64      # The maximum temporal horizon of the tokenizer
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 4           # Causal tokenizer encoder depth
@@ -33,8 +33,7 @@ train:
   device: 'cuda:0'
   use_compile: true
   num_epochs: 100
-  batch_per_gpu: 2
-  context_length: 32
+  batch_per_gpu: 4
   accum_grad_steps: 1
   lr: 1e-4
   num_workers: 12

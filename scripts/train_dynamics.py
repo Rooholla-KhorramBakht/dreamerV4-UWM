@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from functools import partial
 from dreamerv4.single_stream.utils import load_tokenizer, load_denoiser
-from dreamerv4.single_stream.dynamics import DreamerV4DenoiserCfg, DreamerV4Denoiser
+from dreamerv4.single_stream.dynamics import DenoiserWrapper
 from dreamerv4.datasets import create_distributed_dataloader
 from dreamerv4.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
 from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss
@@ -25,7 +25,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 torch.autograd.set_detect_anomaly(True)
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-8):
-    def lr_lambda(current_, compile=cfg.train.use_compilestep):
+    def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             # Linear warmup
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -61,7 +61,7 @@ def main(cfg: DictConfig):
 
     # tokenizer = load_tokenizer(cfg, device=device, compile=cfg.train.use_compile)
     tokenizer = load_tokenizer(cfg, device=device) 
-    denoiser = load_denoiser(cfg, device=device)
+    denoiser = DenoiserWrapper(cfg)
     diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
     tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
     denoiser = denoiser.to(device, dtype=torch.bfloat16)
@@ -103,14 +103,21 @@ def main(cfg: DictConfig):
         learnable_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
         print(f"Total learnable parameters: {learnable_params:,}")
 
+    # Freeze tokenizer
+    tokenizer.eval()
+    for p in tokenizer.parameters():
+        p.requires_grad_(False)
+    
     if cfg.train.use_compile:
         denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=False)
-        tokenizer = torch.compile(tokenizer, mode="max-autotune-no-cudagraphs", fullgraph=False)
+        tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
+
 
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=False)
 
     # Create optimizer
     optim = torch.optim.AdamW(denoiser.parameters(), lr=1e-4, weight_decay=0.1)
+    
 
 
     steps_per_epoch = len(train_loader)
@@ -124,16 +131,16 @@ def main(cfg: DictConfig):
     log_dir = None
     start_epoch = 0
     global_update = 0  # counts optimizer updates
-    
-    if cfg.reload_checkpoint is not None:
+
+    if cfg.dynamics_ckpt is not None:
         # Try loading checkpoint BEFORE initializing W&B
+        print("Resuming from checkpoint:", cfg.dynamics_ckpt)
         start_epoch, global_update, wandb_run_id, log_dir = load_ddp_checkpoint(
-            ckpt_path=cfg.reload_checkpoint,
-            dyn=denoiser,
+            ckpt_path=cfg.dynamics_ckpt,
+            model=denoiser,
             optim=optim,
             scheduler=scheduler,
             rank=rank,
-            device=device,
         )
     else:
         if rank == 0:
@@ -201,7 +208,6 @@ def main(cfg: DictConfig):
     epoch_losses = []
     epoch_fps = []
     epoch_data_times = []
-    breakpoint()
     for epoch in range(start_epoch, cfg.train.num_epochs):
         # --- TRAIN PHASE ---
         denoiser.train()
@@ -223,8 +229,6 @@ def main(cfg: DictConfig):
         accum_total = 0.0
 
         for step_idx, batch in enumerate(train_loader):
-            #if step_idx > steps_per_epoch:
-            #    break
             micro_idx = step_idx % cfg.train.accum_grad_steps
             is_last_micro = (micro_idx == cfg.train.accum_grad_steps - 1)
 
@@ -249,10 +253,10 @@ def main(cfg: DictConfig):
             # Zero grads at the start of each accumulation window
             if micro_idx == 0:
                 optim.zero_grad(set_to_none=True)
-
             # Encode (Frozen)
             with torch.no_grad():
-                z_clean = tokenizer.encode(images).detach().clone()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    z_clean = tokenizer.encode(images).detach().clone()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # z_clean_bf16 = z_clean.to(torch.bfloat16)
@@ -314,7 +318,7 @@ def main(cfg: DictConfig):
                         ckpt_path=ckpt_path,
                         epoch=epoch,
                         global_update=global_update,
-                        dyn=denoiser,
+                        model=denoiser,
                         optim=optim,
                         scheduler=scheduler,
                         rank=rank,

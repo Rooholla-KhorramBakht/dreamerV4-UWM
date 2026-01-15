@@ -137,40 +137,6 @@ class ForwardDiffusionWithShortcut(nn.Module):
 
 
 # ------------------------------------------------------------
-# 6. apply_denoiser helper
-# ------------------------------------------------------------
-
-def apply_denoiser(
-    denoiser: DreamerV4Denoiser,
-    x_tau: torch.Tensor,              # (B, T, N_lat, D_latent)
-    tau_index: torch.Tensor,          # (B, T) long
-    step_index: torch.Tensor,         # (B, T) long
-    actions: Optional[torch.Tensor] = None,  # (B, T, n_c)
-    no_grad: bool = False,
-) -> torch.Tensor:
-    """
-    Wrapper around DreamerV4Denoiser, returning z_hat ∈ ℝ^{B,T,N_lat,D_latent}.
-    """
-    if no_grad:
-        with torch.no_grad():
-            return denoiser(
-                latent_tokens=x_tau,
-                diffusion_step=tau_index,
-                shortcut_length=step_index,
-                actions=actions,
-                causal=True,
-            )
-    else:
-        return denoiser(
-            latent_tokens=x_tau,
-            diffusion_step=tau_index,
-            shortcut_length=step_index,
-            actions=actions,
-            causal=True,
-        )
-
-
-# ------------------------------------------------------------
 # 7. Shortcut / bootstrap loss (Eq. 7 + Eq. 8)
 # ------------------------------------------------------------
 
@@ -327,53 +293,41 @@ def compute_bootstrap_diffusion_loss(
     with torch.no_grad():
         # Optional: Switch to eval to avoid updating BN stats or Dropout 
         denoiser.eval() 
-        
         # ------- First half-step -------
-        f1 = apply_denoiser(
-            denoiser,
-            x_tau_detached.clone(),
-            tau_index,
-            half_step_index,
-            # Clone actions to prevent in-place mutation of the original tensor
-            actions=actions.clone() if actions is not None else None,
-            no_grad=True,
-        )
+        f1 = denoiser(
+                    noisy_z=x_tau_detached,
+                    sigma_idx=tau_index,
+                    step_idx=half_step_index,
+                    action=actions.clone() if actions is not None else None,
+                )
 
         b1 = (f1 - x_tau) / (1.0 - tau_b)
         z_prime = x_tau + b1 * (step_b / 2.0)
-
         # ------- Second half-step -------
-        f2 = apply_denoiser(
-            denoiser,
-            z_prime,
-            tau_plus_half_index,
-            half_step_index,
-            actions=actions.clone() if actions is not None else None,
-            no_grad=True,
-        )
+        f2 = denoiser(
+                    noisy_z=z_prime,
+                    sigma_idx=tau_plus_half_index,
+                    step_idx=half_step_index,
+                    action=actions.clone() if actions is not None else None,
+                )
 
         denom2 = 1.0 - (tau_b + step_b / 2.0)
         b2 = (f2 - z_prime) / denom2
         
         v_target = 0.5 * (b1 + b2)
-        
-        denoiser.train() # Restore train mode if switched
-
+    
+    denoiser.train() # Restore train mode if switched
     # =================================================
     # 2) Big-step prediction (Gradient Tracked)
     #    Now safe to run because no subsequent calls 
     #    will invalidate its saved state.
     # =================================================
-    z_hat = apply_denoiser(
-        denoiser,
-        x_tau_detached.clone().requires_grad_(True),
-        tau_index,
-        step_index,
-        # Clone here too for safety
-        actions=actions.clone() if actions is not None else None,
-        no_grad=False,
-    )
-
+    z_hat = denoiser(
+                    noisy_z=x_tau_detached.clone().requires_grad_(True),
+                    sigma_idx=tau_index,
+                    step_idx=step_index,
+                    action=actions.clone() if actions is not None else None,
+                )
     # =================================================
     # 3) Losses
     # =================================================

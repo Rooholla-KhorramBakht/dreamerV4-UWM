@@ -100,7 +100,7 @@ def load_ddp_checkpoint(
     wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
     log_dir = ckpt.get("log_dir", None)            # NEW
 
-    model.module.load_state_dict(ckpt["dyn"])
+    model.load_state_dict(ckpt["dyn"])
 
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])
