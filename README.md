@@ -35,7 +35,7 @@ First download our [checkpoints](https://huggingface.co/Rooholla/dreamer-v4) and
 | Dynamics | 1.5B | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-large.yaml)  | 128×128 | Soon! |
 
 
-Now you can run the interactive world environments as follows. By default, the scripts will use the keyboard to command the robot (WASD keys). However we strongly recommend using an X-Box USB joystick to interact with the environments. In this case, add the `--xbox` argument to the play scripts:
+Now you can run the interactive world environments as follows. We sddume an X-Box USB joystick controller is connected. In this case, add the `--xbox` argument to the play scripts:
 
 ### SOAR World Model 
 ```bash
