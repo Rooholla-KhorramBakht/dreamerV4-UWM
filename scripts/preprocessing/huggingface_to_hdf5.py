@@ -29,14 +29,14 @@ def write_shard(episodes, output_path, shard_idx, image_shape, action_shape):
     if not episodes: return
     num_episodes = len(episodes)
     max_length = max(ep['length'] for ep in episodes)
-    
+
     shard_filename = output_path / f"shard_{shard_idx:04d}.h5"
     with h5py.File(shard_filename, 'w') as f:
         comp_args = {'compression': 'gzip', 'compression_opts': 4}
         
         # Datasets
-        images_ds = f.create_dataset('images', shape=(num_episodes, max_length, *image_shape), dtype=np.uint8, chunks=(1, max_length, *image_shape), **comp_args)
-        actions_ds = f.create_dataset('actions', shape=(num_episodes, max_length, *action_shape), dtype=np.float32, chunks=(1, max_length, *action_shape), **comp_args)
+        images_ds = f.create_dataset('images', shape=(num_episodes, max_length, *image_shape), dtype=np.uint8, chunks=(1, 128, *image_shape), **comp_args)
+        actions_ds = f.create_dataset('actions', shape=(num_episodes, max_length, *action_shape), dtype=np.float32, chunks=(1, 128, *action_shape), **comp_args)
         
         lengths = []
         for i, ep in enumerate(episodes):
@@ -87,7 +87,8 @@ def convert_dataset(args):
     
     sample_img_shape = None
     sample_act_shape = None
-
+    assert source_fps > args.target_fps > 0, "Target FPS must be less than Source FPS and greater than 0"
+    assert source_fps % args.target_fps == 0, "Source FPS must be divisible by Target FPS"
     for idx in tqdm(range(len(dataset))):
         sample = dataset[idx]
         curr_episode_idx = sample['episode_index'].item()
@@ -215,8 +216,7 @@ def main():
     # State key removed as it is not needed for Action Deltas
 
     args = parser.parse_args()
-    assert args.source_fps > args.target_fps > 0, "Target FPS must be less than Source FPS and greater than 0"
-    assert args.source_fps % args.target_fps == 0, "Source FPS must be divisible by Target FPS"
+
     
     if LEROBOT_AVAILABLE: convert_dataset(args)
     else: print("Please install 'lerobot'")

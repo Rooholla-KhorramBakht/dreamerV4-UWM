@@ -4,9 +4,9 @@ defaults:
 
 dual_stream: false
 tokenizer_ckpt: checkpoints/tokenizer_ckpts/soar.pt
-dynamics_ckpt: checkpoints/dynamics_ckpts/soar-small.pt
+dynamics_ckpt: null
 reload_checkpoint: null
-output_dir: checkpoints/dynamics_ckpts/soar-small/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics_ckpts/finger-small/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25
@@ -27,7 +27,7 @@ denoiser:
   dropout_prob: 0.0
   qk_norm: false
   num_noise_levels: 128
-  n_actions: 7
+  n_actions: 3
 
 train:
   device: 'cuda:0'

@@ -10,7 +10,7 @@ output_dir: checkpoints/dynamics_ckpts/soar-large/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25
-save_every: 1000
+save_every: 10000
 seed: 42
 
 denoiser:

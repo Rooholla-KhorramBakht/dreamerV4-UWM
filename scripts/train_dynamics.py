@@ -126,9 +126,10 @@ def main(cfg: DictConfig):
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
     
     wandb_run_id = cfg.wandb.run_name
-    log_dir = cfg.output_dir
+    log_dir = None
     start_epoch = 0
     global_update = 0  # counts optimizer updates
+    ckpt_path = None
 
     if cfg.reload_checkpoint is not None:
         # Try loading checkpoint BEFORE initializing W&B
@@ -145,14 +146,13 @@ def main(cfg: DictConfig):
             print("Not resuming from checkpoint, starting from scratch.")
 
     # TensorBoard + wandb (rank 0 only)
-    ckpt_path = None
     if rank == 0:
-        # Use stable log_dir if resuming, otdist.all_reduce(loss_sum_t, op=dist.ReduceOp.SUM)herwise create new one
+        # Use stable log_dir if resuming, otherwise create new one
         if log_dir is None:
             now = datetime.datetime.now()
-            log_dir = f"./logs/dreamer_v4_dynamics/{now.strftime('%Y-%m-%d_%H-%M-%S')}"
+            log_dir = cfg.output_dir
             os.makedirs(log_dir, exist_ok=True)
-            ckpt_path = os.path.join(log_dir, "latest.pt")
+            ckpt_path = os.path.join(log_dir)
         else:
             # Resuming: reuse existing log_dir
             print(f"Reusing log directory: {log_dir}")
@@ -253,7 +253,6 @@ def main(cfg: DictConfig):
             # Time the training step
             torch.cuda.synchronize(device)
             step_start = time.perf_counter()
-controller = VRController(action_dim=generator.action_dim)
             # Forward pass
             # Zero grads at the start of each accumulation window
             if micro_idx == 0:
@@ -318,7 +317,7 @@ controller = VRController(action_dim=generator.action_dim)
                     if rank == 0:
                         print(f"[Checkpoint] Saving at global_update={global_update}")
                     save_ddp_checkpoint(
-                        ckpt_path=ckpt_path,
+                        ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
                         epoch=epoch,
                         global_update=global_update,
                         model=denoiser,
@@ -385,7 +384,7 @@ controller = VRController(action_dim=generator.action_dim)
             print(f"{'='*60}\n")
 
         save_ddp_checkpoint(
-            ckpt_path=ckpt_path,
+            ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
             epoch=epoch,
             global_update=global_update,
             model=denoiser,
@@ -434,4 +433,3 @@ controller = VRController(action_dim=generator.action_dim)
 
 if __name__ == "__main__":
     main()
-controller = VRController(action_dim=generator.action_dim)
