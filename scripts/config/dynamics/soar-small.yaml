@@ -35,6 +35,8 @@ train:
   use_compile: true
   num_epochs: 100
   batch_per_gpu: 2
+  long_seq_batch_per_gpu: 4
+  long_seq_prob: 0.1
   accum_grad_steps: 1
   weight_decay: 0.1
   lr: 1e-4

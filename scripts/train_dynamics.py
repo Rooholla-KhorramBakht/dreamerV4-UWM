@@ -211,8 +211,10 @@ def main(cfg: DictConfig):
     # Track statistics
     epoch_times = []
     epoch_losses = []
+    epoch_losses_long = []
     epoch_fps = []
     epoch_data_times = []
+    
     for epoch in range(start_epoch, cfg.train.num_epochs):
         # --- TRAIN PHASE ---
         denoiser.train()
@@ -222,21 +224,25 @@ def main(cfg: DictConfig):
 
         epoch_start = time.perf_counter()
         epoch_loss_sum = 0.0
+        epoch_loss_sum_long = 0.0
         step_times = []
         data_times = []
         data_start = time.perf_counter()
 
-        num_updates = 0
-
+        num_updates_short = 0
+        num_updates_long = 0
         # Accumulators over the current accumulation window
         accum_flow = 0.0
         accum_shortcut = 0.0
         accum_total = 0.0
+        accum_flow_long = 0.0
+        accum_shortcut_long = 0.0
+        accum_total_long = 0.0
+        long_seq_sample = False
 
         for step_idx, batch in enumerate(train_loader):
             micro_idx = step_idx % cfg.train.accum_grad_steps
             is_last_micro = (micro_idx == cfg.train.accum_grad_steps - 1)
-
             # --- measure how long we waited for this batch to arrive ---
             data_end = time.perf_counter()
             data_time = data_end - data_start
@@ -245,6 +251,17 @@ def main(cfg: DictConfig):
             # Move data to device
             images = batch['image'].to(device, non_blocking=True)  # (B, T, C, H, W)
             actions = batch['action'].to(device, non_blocking=True)  # (B, T, action_dim)
+            
+            if long_seq_sample:
+                B = cfg.train.long_seq_batch_per_gpu
+                assert B <= cfg.train.batch_per_gpu, "long_seq_batch_per_gpu must be <= batch_per_gpu"
+                images = images[:B]
+                actions = actions[:B]
+            else:
+                T_max = cfg.denoiser.context_length
+                assert T_max <= images.shape[1], "context_length exceeds sequence length in data"
+                images = images[:, :T_max]
+                actions = actions[:, :T_max]
 
             # Convert to bfloat16
             images = images.to(torch.bfloat16)
@@ -274,64 +291,80 @@ def main(cfg: DictConfig):
             
             # 3. Accumulate values for logging (DETACHED)
             # Use .item() to ensure you store Python floats, not graph nodes
-            accum_flow += flow_loss.item() 
-            accum_shortcut += bootstrap_loss.item()
-            accum_total += (flow_loss.item() + bootstrap_loss.item())
+
+            if not long_seq_sample:
+                accum_flow += flow_loss.item() 
+                accum_shortcut += bootstrap_loss.item()
+                accum_total += (flow_loss.item() + bootstrap_loss.item())
+            else:
+                accum_flow_long += flow_loss.item() 
+                accum_shortcut_long += bootstrap_loss.item()
+                accum_total_long += (flow_loss.item() + bootstrap_loss.item())
 
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
-
                 optim.step()
                 scheduler.step()
                 global_update += 1
-                total_mean = torch.tensor([accum_total], device=device)
-                dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)   # average across ranks
-                sync_loss = total_mean.item()
-                epoch_loss_sum += sync_loss
-                num_updates += 1
+                # Compute synchronized loss across all ranks
+                
+                if long_seq_sample:
+                    total = torch.tensor([accum_total_long], device=device)
+                    dist.all_reduce(total, op=dist.ReduceOp.AVG)
+                    sync_loss_long = total.item()
+                    epoch_loss_sum_long += sync_loss_long
+                    num_updates_long += 1
 
-                # sums over accumulation window on this rank
-                flow_sum = torch.tensor([accum_flow], device=device)
-                short_sum = torch.tensor([accum_shortcut], device=device)
+                    if rank == 0:
+                        tb_writer.add_scalar("train/total_loss_long", sync_loss_long, global_update)
+                        tb_writer.add_scalar("train/flow_loss_long", accum_flow_long / cfg.train.accum_grad_steps, global_update)
+                        tb_writer.add_scalar("train/shortcut_loss_long", accum_shortcut_long / cfg.train.accum_grad_steps, global_update)
+                else:
+                    total = torch.tensor([accum_total], device=device)
+                    dist.all_reduce(total, op=dist.ReduceOp.AVG)
+                    sync_loss = total.item()
+                    epoch_loss_sum += sync_loss
+                    num_updates_short += 1
 
-                dist.all_reduce(flow_sum, op=dist.ReduceOp.AVG)
-                dist.all_reduce(short_sum, op=dist.ReduceOp.AVG)
-
-                flow_sum = flow_sum.item()
-                short_sum = short_sum.item()
-
-                flow_mean = flow_sum / cfg.train.accum_grad_steps
-                short_mean = short_sum / cfg.train.accum_grad_steps
+                    if rank == 0:
+                        tb_writer.add_scalar("train/total_loss_short", sync_loss, global_update)
+                        tb_writer.add_scalar("train/flow_loss_short", accum_flow / cfg.train.accum_grad_steps, global_update)
+                        tb_writer.add_scalar("train/shortcut_loss_short", accum_shortcut / cfg.train.accum_grad_steps, global_update)
 
                 if rank == 0:
-                    # Sums over micro-batches in this update
-                    tb_writer.add_scalar("train/flow_loss_mean", flow_mean, global_update)
-                    tb_writer.add_scalar("train/shortcut_loss_mean", short_mean, global_update)
-                    tb_writer.add_scalar("train/total_loss_mean", sync_loss, global_update)
-                    current_lr = scheduler.get_last_lr()[0]
-                    tb_writer.add_scalar("train/lr", current_lr, global_update)
+                    tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_update)
+                    tb_writer.add_scalar("train/long_seq_sampled", float(long_seq_sample), global_update)
 
-                # Checkpoint every N updates (within epoch)
-                if global_update % cfg.save_every == 0:
-                    if rank == 0:
+                long_next = torch.zeros((), device=device, dtype=torch.bool)
+                if rank == 0:
+                    # Checkpoint every N updates (within epoch)
+                    if global_update % cfg.save_every == 0:
                         print(f"[Checkpoint] Saving at global_update={global_update}")
-                    save_ddp_checkpoint(
-                        ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
-                        epoch=epoch,
-                        global_update=global_update,
-                        model=denoiser,
-                        optim=optim,
-                        scheduler=scheduler,
-                        rank=rank,
-                        wandb_run_id=wandb_run_id,
-                        log_dir=log_dir,
-                    )
+                        save_ddp_checkpoint(
+                            ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
+                            epoch=epoch,
+                            global_update=global_update,
+                            model=denoiser,
+                            optim=optim,
+                            scheduler=scheduler,
+                            rank=rank,
+                            wandb_run_id=wandb_run_id,
+                            log_dir=log_dir,
+                        )
+
+                    long_next = (torch.rand((), device=device) < cfg.train.long_seq_prob)
+
+                dist.broadcast(long_next, src=0)
+                long_seq_sample = bool(long_next.item())
 
                 # Reset accumulators for next accumulation window
                 accum_flow = 0.0
                 accum_shortcut = 0.0
                 accum_total = 0.0
+                accum_flow_long = 0.0
+                accum_shortcut_long = 0.0
+                accum_total_long = 0.0
 
             torch.cuda.synchronize(device)
             step_end = time.perf_counter()
@@ -341,34 +374,19 @@ def main(cfg: DictConfig):
             # Next data timing starts now (time until next batch is yielded)
             data_start = time.perf_counter()
 
-            # Print progress every 200 steps
-            if rank == 0 and is_last_micro and (global_update % 200 == 0):
-                avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
-                avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
-
-                # frames_per_step = cfg.train.batch_per_gpu * cfg.denoiser.context_length * world_size
-                # step_fps = frames_per_step / avg_step_time
-                # data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
-
-                # print(
-                #     f"Epoch {epoch+1}/{cfg.train.num_epochs} | "
-                #     f"Step {step_idx+1}/{steps_per_epoch} | "
-                #     f"Loss: {sync_loss:.6f} | "
-                #     f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
-                #     f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
-                # )
-
         epoch_end = time.perf_counter()
         epoch_time = epoch_end - epoch_start
-
         # Compute epoch statistics
-        avg_loss = epoch_loss_sum / num_updates
+        avg_loss = epoch_loss_sum / num_updates_short if num_updates_short > 0 else 0.0
+        avg_loss_long = epoch_loss_sum_long / num_updates_long if num_updates_long > 0 else 0.0
+
         total_frames = cfg.train.batch_per_gpu * cfg.denoiser.context_length * world_size * steps_per_epoch
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 
         epoch_times.append(epoch_time)
         epoch_losses.append(avg_loss)
+        epoch_losses_long.append(avg_loss_long)
         epoch_fps.append(epoch_fps_val)
         epoch_data_times.append(avg_data_time_epoch)
 
@@ -405,7 +423,8 @@ def main(cfg: DictConfig):
         print(f"{'='*60}")
         print(f"Overall Statistics (across {cfg.train.num_epochs} epochs):")
         print(f"  Average epoch time: {sum(epoch_times)/len(epoch_times):.2f}s")
-        print(f"  Average loss: {sum(epoch_losses)/len(epoch_losses):.6f}")
+        print(f"  Average loss (short): {sum(epoch_losses)/len(epoch_losses):.6f}")
+        print(f"  Average loss (long): {sum(epoch_losses_long)/len(epoch_losses_long):.6f}")
         print(f"  Average FPS: {sum(epoch_fps)/len(epoch_fps):.2f}")
         print(f"  Min FPS: {min(epoch_fps):.2f}")
         print(f"  Max FPS: {max(epoch_fps):.2f}")
