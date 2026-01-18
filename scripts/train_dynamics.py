@@ -69,7 +69,7 @@ def main(cfg: DictConfig):
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
-        window_size=cfg.denoiser.max_context_length,
+        window_size=cfg.denoiser.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
@@ -85,7 +85,7 @@ def main(cfg: DictConfig):
 
     test_loader, test_sampler, test_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
-        window_size=cfg.denoiser.max_context_length,
+        window_size=cfg.denoiser.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
@@ -111,8 +111,8 @@ def main(cfg: DictConfig):
     
     if cfg.train.use_compile:
         # denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=False)
-        denoiser = torch.compile(denoiser, mode="max-autotune", fullgraph=True)
-        tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
+        denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=True)
+        tokenizer = torch.compile(tokenizer, mode="max-autotune-no-cudagraphs", fullgraph=False)
 
 
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=False)
@@ -346,24 +346,24 @@ def main(cfg: DictConfig):
                 avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
                 avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
-                frames_per_step = cfg.train.batch_per_gpu * cfg.denoiser.max_context_length * world_size
-                step_fps = frames_per_step / avg_step_time
-                data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
+                # frames_per_step = cfg.train.batch_per_gpu * cfg.denoiser.context_length * world_size
+                # step_fps = frames_per_step / avg_step_time
+                # data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
-                print(
-                    f"Epoch {epoch+1}/{cfg.train.num_epochs} | "
-                    f"Step {step_idx+1}/{steps_per_epoch} | "
-                    f"Loss: {sync_loss:.6f} | "
-                    f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
-                    f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
-                )
+                # print(
+                #     f"Epoch {epoch+1}/{cfg.train.num_epochs} | "
+                #     f"Step {step_idx+1}/{steps_per_epoch} | "
+                #     f"Loss: {sync_loss:.6f} | "
+                #     f"Data: {avg_data_time:.3f}s ({data_fps:.1f} fps) | "
+                #     f"Compute: {avg_step_time:.3f}s ({step_fps:.1f} fps)"
+                # )
 
         epoch_end = time.perf_counter()
         epoch_time = epoch_end - epoch_start
 
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
-        total_frames = cfg.train.batch_per_gpu * cfg.denoiser.max_context_length * world_size * steps_per_epoch
+        total_frames = cfg.train.batch_per_gpu * cfg.denoiser.context_length * world_size * steps_per_epoch
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 

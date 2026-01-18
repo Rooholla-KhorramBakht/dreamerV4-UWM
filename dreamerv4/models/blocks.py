@@ -7,6 +7,19 @@ from dataclasses import dataclass
 from typing import Tuple, Optional, List
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+def create_temporal_window_mask(T: int, context_length: int, device="cpu") -> torch.Tensor:
+    """
+    SDPA boolean mask:
+      True  -> allowed
+      False -> masked out
+    Shape: (T, T)
+    """
+    q = torch.arange(T, device=device).view(T, 1)  # (T,1)
+    k = torch.arange(T, device=device).view(1, T)  # (1,T)
+    causal_ok = (k <= q)
+    window_ok = ((q - k) < context_length)
+    return causal_ok & window_ok
+
 def create_temporal_mask(T: int, device: str = "cpu") -> torch.Tensor:
     """
     Standard causal mask for attention:
@@ -400,6 +413,7 @@ class EfficientTransformerLayer(nn.Module):
         max_seq_len: int,
         layer_type: LayerType,
         dropout_prob: float = 0.0,
+        context_length: Optional[int] = None,
         qk_norm: bool = True,
         is_causal: bool = True,
         rope_embedder: Optional[RopeEmbedding] = None,
@@ -412,6 +426,8 @@ class EfficientTransformerLayer(nn.Module):
         self.is_causal = is_causal
         # Use shared RoPE if available
         self.rope = rope_embedder
+        self.max_seq_len = max_seq_len
+        self.context_length = context_length
 
         # Axial attention
         self.attn = AxialAttention(
@@ -452,13 +468,30 @@ class EfficientTransformerLayer(nn.Module):
         # Attention block
         h = self.norm1(x)
         if self.layer_type == LayerType.TEMPORAL:
-            h = self.attn(h, h, h, dim=1, 
-                          causal=self.is_causal, 
-                          kv_cache = kv_cache,
-                          update_cache=update_cache,
-                          kv_position_ids=position_ids,
-                          q_position_ids=position_ids,
-                          ) # Temporal dimension has caching
+            T = h.shape[1]
+            if (kv_cache is None) and (self.context_length is not None) and (self.context_length < T):
+                temporal_mask = create_temporal_window_mask(
+                    T=T,
+                    context_length=self.temporal_context_length,
+                    device=h.device,
+                    position_ids=position_ids,  # (T,)
+                )
+                h = self.attn(
+                    h, h, h, dim=1,
+                    mask=temporal_mask,   # True=allowed
+                    causal=False,         # MUST be False since we pass mask
+                    kv_cache=None,
+                    kv_position_ids=position_ids,
+                    q_position_ids=position_ids,
+                )
+            else:
+                h = self.attn(h, h, h, dim=1, 
+                            causal=self.is_causal, 
+                            kv_cache = kv_cache,
+                            update_cache=update_cache,
+                            kv_position_ids=position_ids,
+                            q_position_ids=position_ids,
+                            ) # Temporal dimension has caching
         else:
             h = self.attn(h, h, h, dim=2, mask=spatial_mask) # Spatial dimension has no caching (check here)
         x = x + self.dropout(h)
@@ -481,9 +514,9 @@ class EfficientTransformerBlock(nn.Module):
         model_dim: int,
         n_heads: int,
         n_kv_heads: int,
-        # max_seq_len: int,
         temporal_dim_max_seq_len: int,
         modality_dim_max_seq_len: int,
+        context_length: Optional[int] = None,
         dropout_prob: float = 0.0,
         qk_norm: bool = True,
         is_causal: bool = True,
@@ -497,6 +530,7 @@ class EfficientTransformerBlock(nn.Module):
         self.temporal_dim_max_seq_len = temporal_dim_max_seq_len
         self.is_causal = is_causal
         self.caches: Optional[List[KVCache]] = None  # to be initialized later
+        self.context_length = context_length
         # Default block layout
         if layer_types is None:
             layer_types = [
@@ -515,6 +549,7 @@ class EfficientTransformerBlock(nn.Module):
                         n_heads=n_heads,
                         n_kv_heads=n_kv_heads,
                         max_seq_len=temporal_dim_max_seq_len,
+                        context_length=context_length,
                         layer_type=layer,
                         dropout_prob=dropout_prob,
                         qk_norm=qk_norm,

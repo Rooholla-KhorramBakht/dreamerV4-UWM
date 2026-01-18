@@ -312,8 +312,6 @@ def main(cfg: DictConfig):
     torch.manual_seed(cfg.seed + rank)
         
     # Batch size per GPU
-    T = cfg.tokenizer.max_context_length
-    # STEPS_PER_EPOCH = 500  # Limit steps per epoch for faster benchmarking
     effective_global_batch = cfg.train.batch_per_gpu * world_size * cfg.train.grad_accum_steps
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
@@ -340,7 +338,7 @@ def main(cfg: DictConfig):
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
-        window_size=cfg.tokenizer.max_context_length,
+        window_size=cfg.tokenizer.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
@@ -356,7 +354,7 @@ def main(cfg: DictConfig):
 
     test_loader, test_sampler, test_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
-        window_size=cfg.tokenizer.max_context_length,
+        window_size=cfg.tokenizer.max_sequence_length,
         batch_size=cfg.train.batch_per_gpu,
         rank=rank,
         world_size=world_size,
@@ -625,7 +623,7 @@ def main(cfg: DictConfig):
                 avg_step_time = sum(step_times[-200:]) / len(step_times[-200:])
                 avg_data_time = sum(data_times[-200:]) / len(data_times[-200:])
 
-                frames_per_step = cfg.train.batch_per_gpu * cfg.tokenizer.max_context_length * world_size
+                frames_per_step = cfg.train.batch_per_gpu * cfg.tokenizer.max_sequence_length * world_size
                 step_fps = frames_per_step / avg_step_time
                 data_fps = frames_per_step / avg_data_time if avg_data_time > 0 else float('inf')
 
@@ -642,7 +640,7 @@ def main(cfg: DictConfig):
 
         # Compute epoch statistics
         avg_loss = epoch_loss_sum / num_updates
-        total_frames = cfg.train.batch_per_gpu * cfg.tokenizer.max_context_length * world_size * STEPS_PER_EPOCH
+        total_frames = cfg.train.batch_per_gpu * cfg.tokenizer.context_length * world_size * STEPS_PER_EPOCH
         epoch_fps_val = total_frames / epoch_time
         avg_data_time_epoch = sum(data_times) / len(data_times)
 

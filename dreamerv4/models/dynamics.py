@@ -31,7 +31,8 @@ class DreamerV4DenoiserCfg:
     num_action_tokens: int          # S_a
     num_latent_tokens: int
     num_register_tokens: int
-    max_context_length: int
+    max_sequence_length: int
+    context_length: int
     model_dim: int
     latent_dim: int
     n_layers: int
@@ -83,7 +84,8 @@ class DreamerV4Denoiser(nn.Module):
                 dropout_prob=cfg.dropout_prob,
                 qk_norm=cfg.qk_norm,
                 modality_dim_max_seq_len=self.num_modality_tokens,
-                temporal_dim_max_seq_len= (max_num_forward_steps if max_num_forward_steps is not None else cfg.max_context_length),                
+                temporal_dim_max_seq_len= (max_num_forward_steps if max_num_forward_steps is not None else cfg.max_sequence_length),   
+                context_length=cfg.context_length,             
             )
             for _ in range(cfg.n_layers)
         ])

@@ -89,7 +89,7 @@ def main(cfg: DictConfig):
     # controller.start()
   
     print("Starting joystick-controlled DreamerV4 rollout...")
-    for i in tqdm(range(NUM_FORWARD_STEPS-cfg.denoiser.max_context_length)):
+    for i in tqdm(range(NUM_FORWARD_STEPS-cfg.denoiser.context_length)):
         tic = time.time()
         states = joy.getStates()
         cmd_right = states["right_joy"] 

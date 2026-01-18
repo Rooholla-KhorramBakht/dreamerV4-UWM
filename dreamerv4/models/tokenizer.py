@@ -12,7 +12,8 @@ import math
 class CausalTokenizerConfig:
     num_modality_tokens: int
     num_latent_tokens: int
-    max_context_length: int
+    max_sequence_length: int
+    context_length: int
     model_dim: int
     latent_dim: int
     enc_num_layers: int 
@@ -32,7 +33,7 @@ class CausalTokenizerEncoder(nn.Module):
               patch_embeddings ∈ ℝ^{B, T, S_mod, D_latent}
     """
 
-    def __init__(self, cfg: CausalTokenizerConfig):
+    def __init__(self, cfg: CausalTokenizerConfig, max_num_forward_steps=None):
         super().__init__()
         self.cfg = cfg
 
@@ -50,8 +51,9 @@ class CausalTokenizerEncoder(nn.Module):
                 n_kv_heads=cfg.n_kv_heads,
                 dropout_prob=cfg.dropout_prob,
                 qk_norm=cfg.qk_norm,
-                temporal_dim_max_seq_len=cfg.max_context_length,
+                temporal_dim_max_seq_len=(max_num_forward_steps if max_num_forward_steps is not None else cfg.max_sequence_length),
                 modality_dim_max_seq_len=self.modality_dim_max_seq_len,
+                context_length=cfg.context_length,
             )
             for _ in range(num_layers)
         ])
@@ -130,7 +132,8 @@ class CausalTokenizerDecoder(nn.Module):
                 dropout_prob=cfg.dropout_prob,
                 qk_norm=cfg.qk_norm,
                 modality_dim_max_seq_len=cfg.num_modality_tokens + cfg.num_latent_tokens,
-                temporal_dim_max_seq_len=(max_num_forward_steps if max_num_forward_steps is not None else cfg.max_context_length),
+                temporal_dim_max_seq_len=(max_num_forward_steps if max_num_forward_steps is not None else cfg.max_sequence_length),
+                context_length=cfg.context_length,
             )
             for _ in range(num_layers)
         ])

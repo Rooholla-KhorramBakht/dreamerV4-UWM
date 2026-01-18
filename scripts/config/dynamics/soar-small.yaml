@@ -18,7 +18,8 @@ denoiser:
   num_action_tokens: 1    # Number of tokens for the image or other modalities
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
-  max_context_length: 32      # The maximum temporal horizon of the tokenizer
+  context_length: 32      # The context length for the dynamics model
+  max_sequence_length: 128      # The maximum temporal horizon of the tokenizer during training
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 4           # Causal tokenizer encoder depth
