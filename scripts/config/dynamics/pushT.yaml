@@ -1,12 +1,12 @@
 # @package _global_
 defaults:
- - /tokenizer: /soar
+ - /tokenizer: /pushT
 
 dual_stream: false
-tokenizer_ckpt: checkpoints/tokenizer_ckpts/soar.pt
-dynamics_ckpt: checkpoints/dynamics_ckpts/pushT.pt
+# tokenizer_ckpt: checkpoints/tokenizer_ckpts/soar.pt
+dynamics_ckpt:  checkpoints/dynamics_ckpts/video-pushT-110M.pt
 reload_checkpoint: null
-output_dir: checkpoints/dynamics/soar/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics/pushT/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25

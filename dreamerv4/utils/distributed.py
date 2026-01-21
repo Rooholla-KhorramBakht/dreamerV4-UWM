@@ -42,6 +42,18 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+def unwrap_model(m):
+    # DDP / DataParallel
+    while hasattr(m, "module"):
+        m = m.module
+
+    # torch.compile (OptimizedModule)
+    for attr in ("_orig_mod", "_orig_module", "_orig_model"):
+        if hasattr(m, attr):
+            m = getattr(m, attr)
+
+    return m
+
 def save_ddp_checkpoint(
     ckpt_path: str,
     epoch: int,
@@ -58,7 +70,7 @@ def save_ddp_checkpoint(
         ckpt = {
             "epoch": epoch,
             "global_update": global_update,
-            "model": model.module.state_dict(),  # <- .module to unwrap DDP
+            "model": unwrap_model(model).state_dict(),  # <- .module to unwrap DDP
             "optim": optim.state_dict(),
             "scheduler": scheduler.state_dict(),
             "wandb_run_id": wandb_run_id,
@@ -99,9 +111,7 @@ def load_ddp_checkpoint(
     global_update = ckpt.get("global_update", 0)
     wandb_run_id = ckpt.get("wandb_run_id", None)  # NEW
     log_dir = ckpt.get("log_dir", None)            # NEW
-
-    model.load_state_dict(ckpt["dyn"])
-
+    model.module.load_state_dict(ckpt["model"])
     optim.load_state_dict(ckpt["optim"])
     scheduler.load_state_dict(ckpt["scheduler"])
 

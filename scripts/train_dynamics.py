@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from functools import partial
-from dreamerv4.models.utils import load_tokenizer
+from dreamerv4.models.utils import load_tokenizer, load_denoiser
 from dreamerv4.models.dynamics import DenoiserWrapper
 from dreamerv4.datasets import create_distributed_dataloader
 from dreamerv4.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
@@ -62,7 +62,11 @@ def main(cfg: DictConfig):
         print("Creating encoder and decoder models...")
 
     tokenizer = load_tokenizer(cfg, device=device) 
-    denoiser = DenoiserWrapper(cfg)
+    if cfg.dynamics_ckpt:
+        print(f"Loading dynamics from: {cfg.dynamics_ckpt}")
+        denoiser = load_denoiser(cfg, device=device, model_key='model')
+    else:
+        denoiser = DenoiserWrapper(cfg)
     diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
     tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
     denoiser = denoiser.to(device, dtype=torch.bfloat16)
@@ -77,7 +81,7 @@ def main(cfg: DictConfig):
         stride=1,
         seed=cfg.seed,
         split="train",
-        train_fraction=0.9,
+        train_fraction=cfg.dataset.train_episodes_fraction,
         split_seed=cfg.dataset.split_seed,   # controls which episodes go to train/test
         shuffle=True,
         drop_last=True,
@@ -93,7 +97,7 @@ def main(cfg: DictConfig):
         stride=1,
         seed=cfg.seed,          # seed for sampler sharding (not for split itself)
         split="test",
-        train_fraction=0.9,
+        train_fraction=cfg.dataset.train_episodes_fraction,
         split_seed=cfg.dataset.split_seed,   # must match train_dataset
         shuffle=False,    # evaluation: deterministic order
         drop_last=False,  # keep all test windows
@@ -262,10 +266,12 @@ def main(cfg: DictConfig):
                 assert T_max <= images.shape[1], "context_length exceeds sequence length in data"
                 images = images[:, :T_max]
                 actions = actions[:, :T_max]
-
+            
             # Convert to bfloat16
             images = images.to(torch.bfloat16)
-            actions = actions.to(torch.bfloat16)
+            actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions]
+            if True:
+                actions = torch.zeros_like(actions).to(actions.device, dtype=torch.bfloat16)
 
             # Time the training step
             torch.cuda.synchronize(device)

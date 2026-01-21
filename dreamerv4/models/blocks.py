@@ -87,8 +87,8 @@ class RopeEmbedding(nn.Module):
         thetas_all = torch.stack([thetas*i for i in range(max_seq_len)], dim=0)
         cos_cache = thetas_all.cos() # TxD
         sin_cache = thetas_all.sin() # TxD
-        self.register_buffer('cos_emb', cos_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
-        self.register_buffer('sin_emb', sin_cache.unsqueeze(0).unsqueeze(0)) #1x1xTxD
+        self.register_buffer('cos_emb', cos_cache.unsqueeze(0).unsqueeze(0), persistent=False) #1x1xTxD
+        self.register_buffer('sin_emb', sin_cache.unsqueeze(0).unsqueeze(0), persistent=False) #1x1xTxD
     
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor]=None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, H, T, d = x.shape
@@ -280,7 +280,6 @@ class Attention(nn.Module):
 
         if is_causal:
             assert mask is None, "Causal flag should not be set when mask is provided."
-        
         if self.flash_attention and Q.dtype in (torch.float16, torch.bfloat16) and Q.is_cuda:
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 Y = F.scaled_dot_product_attention(
@@ -488,6 +487,7 @@ class EfficientTransformerLayer(nn.Module):
                 )
             else:
                 h = self.attn(h, h, h, dim=1, 
+                            mask=None,
                             causal=self.is_causal, 
                             kv_cache = kv_cache,
                             update_cache=update_cache,

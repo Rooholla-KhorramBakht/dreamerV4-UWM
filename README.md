@@ -30,7 +30,7 @@ First download our [checkpoints](https://huggingface.co/Rooholla/dreamer-v4) and
 | Checkpoint | Parameters | Dataset | Config | Resolution | Download |
 |:-----------|:----------:|:-----------------:|:----------------:|:----------------:|:---------------:|
 | Tokenizer           | 400M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/) | [config](scripts/config/tokenizer/soar.yaml) |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/tokenizer-soar-400M.pt?download=true) |
-| Dynamics      | 110M | [MiM PushT]() | [config](scripts/config/dynamics/pushT.yaml)  |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamics-pushT-110M.pt?download=true) |
+| Dynamics      | 110M | [MiM PushT](https://huggingface.co/datasets/Rooholla/MiM-PushT) | [config](scripts/config/dynamics/pushT.yaml)  |  256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamics-pushT-110M.pt?download=true) |
 | Dynamics | 110M | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-small.yaml) | 256×256 | [📦](https://huggingface.co/Rooholla/dreamer-v4/resolve/main/dynamicsl-soar-110M.pt?download=true) |
 | Dynamics | 1.5B | [SOAR](https://rail.eecs.berkeley.edu/datasets/soar_release/)     | [config](scripts/config/dynamics/soar-large.yaml)  | 128×128 | Soon! |
 

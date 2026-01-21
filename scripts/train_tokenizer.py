@@ -23,6 +23,7 @@ from functools import partial
 
 from dreamerv4.models.tokenizer import TokenizerWrapper 
 from dreamerv4.models.blocks import EfficientTransformerLayer
+from dreamerv4.models.utils import load_tokenizer
 
 from dreamerv4.datasets import ShardedHDF5Dataset
 from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
@@ -31,6 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 import wandb
 import datetime
 import math
+from pathlib import Path
 
 assert torch.cuda.is_available(), "Tokenizer training requires CUDA"
 class RMSLossScaler:
@@ -64,6 +66,18 @@ class RMSLossScaler:
         # Normalize current loss by running RMS; gradient flows only through value
         return value / rms
 
+def unwrap_model(m):
+    # DDP / DataParallel
+    while hasattr(m, "module"):
+        m = m.module
+
+    # torch.compile (OptimizedModule)
+    for attr in ("_orig_mod", "_orig_module", "_orig_model"):
+        if hasattr(m, attr):
+            m = getattr(m, attr)
+
+    return m
+
 def save_fsdp_checkpoint(
     ckpt_path: str,
     epoch: int,
@@ -85,7 +99,8 @@ def save_fsdp_checkpoint(
     full_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
 
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_cfg):
-        model_state = model.state_dict()  # All ranks participate in gather
+        m = unwrap_model(model)
+        model_state = m.state_dict()  # All ranks participate in gather
 
     # Only rank 0 saves to disk
     if rank == 0:
@@ -268,7 +283,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @record
-@hydra.main(config_path="config", config_name="tokenizer/soar", version_base=None)
+@hydra.main(config_path="config", config_name="tokenizer/pushT", version_base=None)
 def main(cfg: DictConfig):
     torch.backends.cuda.matmul.allow_tf32 = cfg.train.enable_fast_matmul
     # Setup distributed training
@@ -319,19 +334,7 @@ def main(cfg: DictConfig):
     # Create models
     if rank == 0:
         print("Creating encoder and decoder models...")
-    
-    # Todo: Make it cofigurable with hydra
-    tokenizer = TokenizerWrapper(cfg)
-    tokenizer.to(device)
 
-    if cfg.train.use_compile:
-        tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
-
-    # Print parameter counts
-    if rank == 0:
-        learnable_params = sum(p.numel() for p in tokenizer.parameters() if p.requires_grad)
-        print(f"Total learnable parameters: {learnable_params:,}")
-    
     # Wrap with FSDP
     if rank == 0:
         print("Wrapping models with FSDP...")
@@ -367,8 +370,25 @@ def main(cfg: DictConfig):
         shuffle=False,    # evaluation: deterministic order
         drop_last=False,  # keep all test windows
     )
+     # Todo: Make it cofigurable with hydra
+    if cfg.tokenizer_ckpt:
+        print(f'Initializing the tokenizer with: {cfg.tokenizer_ckpt}')
+        tokenizer = load_tokenizer(cfg, device=device)
+        tokenizer.to(device)
+    else:
+        tokenizer = TokenizerWrapper(cfg)
+        tokenizer.to(device)
 
+    if cfg.train.use_compile:
+        tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
+        
+    # Print parameter counts
+    if rank == 0:
+        learnable_params = sum(p.numel() for p in tokenizer.parameters() if p.requires_grad)
+        print(f"Total learnable parameters: {learnable_params:,}")
+    
     tokenizer = setup_fsdp_model(tokenizer, mixed_precision=cfg.train.mixed_precision, sharding_strategy="FULL_SHARD")
+    
     # Create optimizer
     params = tokenizer.parameters()
     optim = torch.optim.AdamW(params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay) 
@@ -379,8 +399,17 @@ def main(cfg: DictConfig):
     warmup_steps = int(0.05 * total_steps)  # 5% warmup
     scheduler = get_cosine_schedule_with_warmup(optim, warmup_steps, total_steps)
 
+    
+    
     # RMS loss normalizer for tokenizer losses
     rms_norm = RMSLossScaler(decay=0.99, eps=1e-8)
+
+    # Initialize model from a previously trained model but start training from scratch
+    wandb_run_id = cfg.wandb.run_name
+    log_dir = None
+    start_epoch = 0
+    global_update = 0  # counts optimizer updates
+    ckpt_path = None
     
     if cfg.reload_checkpoint is not None:
         # Try loading checkpoint BEFORE initializing W&B
@@ -393,19 +422,25 @@ def main(cfg: DictConfig):
             rank=rank,
             device=device,
         )
-        ckpt_path = os.path.join(log_dir, "latest.pt")
     else:
         if rank == 0:
             print("Not resuming from checkpoint, starting from scratch.")
-            wandb_run_id = cfg.wandb.run_id
-            start_epoch = 0
-            global_update = 0  # counts optimizer updates
-            os.makedirs(cfg.output_dir, exist_ok=True)
-            ckpt_path = os.path.join(cfg.output_dir, "latest.pt")
-            log_dir = cfg.output_dir
 
     # TensorBoard + wandb (rank 0 only)
     if rank == 0:
+        # Use stable log_dir if resuming, otherwise create new one
+        if log_dir is None:
+            now = datetime.datetime.now()
+            log_dir = cfg.output_dir
+            os.makedirs(log_dir, exist_ok=True)
+            ckpt_path = os.path.join(log_dir)
+        else:
+            # Resuming: reuse existing log_dir
+            print(f"Reusing log directory: {log_dir}")
+
+        tb_log_dir = os.path.join(log_dir, "tensorboard")
+        os.makedirs(tb_log_dir, exist_ok=True)
+
         # Initialize W&B with resume logic
         if wandb_run_id is not None:
             # Resuming an existing run
@@ -429,7 +464,7 @@ def main(cfg: DictConfig):
         # Capture the W&B run ID for saving in checkpoint
         wandb_run_id = wandb.run.id
 
-        tb_writer = SummaryWriter(log_dir=log_dir)
+        tb_writer = SummaryWriter(log_dir=tb_log_dir)
     else:
         tb_writer = None
         wandb_run_id = None
@@ -445,9 +480,13 @@ def main(cfg: DictConfig):
 
     # Synchronize before training
     dist.barrier()
+    
+    if rank == 0:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, os.path.join(log_dir, "config.yaml"))
+    dist.barrier()
     if rank == 0:
         print("Starting warmup iterations...")
-
     # Track statistics
     epoch_times = []
     epoch_losses = []
@@ -506,7 +545,6 @@ def main(cfg: DictConfig):
             # --- Tokenizer reconstruction losses: MSE + 0.2 * LPIPS, with RMS normalization ---
             # 1) Pixel MSE in the native scale of your data
             mse_loss = nn.functional.mse_loss(x_hat, images)
-
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # 2) LPIPS perceptual loss expects images in [-1, 1]
                 images_lpips = (images * 2.0) - 1.0          # [B, T, C, H, W] -> [-1,1]
@@ -576,7 +614,7 @@ def main(cfg: DictConfig):
                 lpips_mean = lpips_sum / cfg.train.grad_accum_steps
                 raw_mean = raw_sum / cfg.train.grad_accum_steps
 
-                if rank == 0 and num_updates%100==0:
+                if rank == 0 and num_updates%5==0:
                     # Sums over micro-batches in this update
                     tb_writer.add_scalar("train/mse_mean", mse_mean, global_update)
                     tb_writer.add_scalar("train/lpips_mean", lpips_mean, global_update)
@@ -590,7 +628,7 @@ def main(cfg: DictConfig):
                     if rank == 0:
                         print(f"[Checkpoint] Saving at global_update={global_update}")
                     save_fsdp_checkpoint(
-                        ckpt_path=ckpt_path,
+                        ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
                         epoch=epoch,
                         global_update=global_update,
                         model=tokenizer, 
@@ -724,7 +762,7 @@ def main(cfg: DictConfig):
             print(f"{'='*60}\n")
         print(f"Saving checkpoint for epoch {epoch+1} at path: {ckpt_path}")
         save_fsdp_checkpoint(
-            ckpt_path=ckpt_path,
+            ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
             epoch=epoch,
             global_update=global_update,
             model = tokenizer,

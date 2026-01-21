@@ -69,7 +69,7 @@ class CausalTokenizerEncoder(nn.Module):
             cfg.num_modality_tokens,
             cfg.num_latent_tokens,
         )
-        self.register_buffer("spatial_mask", spatial_mask)
+        self.register_buffer("spatial_mask", spatial_mask, persistent=True)
 
         # Project to latent_dim (typically < model_dim)
         self.output_proj = nn.Linear(cfg.model_dim, cfg.latent_dim)
@@ -149,7 +149,7 @@ class CausalTokenizerDecoder(nn.Module):
             cfg.num_modality_tokens,
             cfg.num_latent_tokens,
         )
-        self.register_buffer("spatial_mask", spatial_mask)
+        self.register_buffer("spatial_mask", spatial_mask, persistent=True)
         # Project latents from latent_dim → model_dim
         self.input_proj = nn.Linear(cfg.latent_dim, cfg.model_dim)
 
