@@ -3,6 +3,8 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 from .models.dynamics import DreamerV4Denoiser
+import torch.distributed as dist
+
 
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
     """
@@ -352,3 +354,33 @@ def compute_bootstrap_diffusion_loss(
     bootstrap_loss = boot_loss_per.sum() / denom_boot
 
     return flow_loss, bootstrap_loss
+
+
+class RMSLossScaler:
+    """
+    Tracks running RMS for named losses and returns normalized losses.
+    """
+    def __init__(self, decay: float = 0.99, eps: float = 1e-8):
+        self.decay = decay
+        self.eps = eps
+        self.ema_sq = {}  # name -> scalar tensor
+
+    def __call__(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        # value is a scalar loss tensor (per-batch, per-rank)
+        with torch.no_grad():
+            sq = value.detach().pow(2)
+            mean_sq = sq.mean()
+
+            # Optionally average across ranks for a global RMS
+            if dist.is_initialized():
+                dist.all_reduce(mean_sq, op=dist.ReduceOp.AVG)
+
+            if name not in self.ema_sq:
+                self.ema_sq[name] = mean_sq
+            else:
+                self.ema_sq[name] = (
+                    self.decay * self.ema_sq[name] + (1.0 - self.decay) * mean_sq
+                )
+            rms = (self.ema_sq[name] + self.eps).sqrt()
+        # Normalize current loss by running RMS; gradient flows only through value
+        return value / rms

@@ -45,6 +45,7 @@ train:
   num_training_steps: 1e7
   enable_fast_matmul: true
   clip_grad_norm: 1.0
+  video_pretraining: false # Set the action to zero in doing video pretraining
 
 wandb:
   enable: true

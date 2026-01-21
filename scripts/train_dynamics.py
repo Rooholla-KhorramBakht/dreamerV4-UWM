@@ -8,7 +8,7 @@ from dreamerv4.models.utils import load_tokenizer, load_denoiser
 from dreamerv4.models.dynamics import DenoiserWrapper
 from dreamerv4.datasets import create_distributed_dataloader
 from dreamerv4.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
-from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss
+from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss, RMSLossScaler
 
 from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
 from torch.utils.tensorboard import SummaryWriter
@@ -39,7 +39,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 @record
-@hydra.main(config_path="config", config_name="dynamics/soar-large", version_base=None)
+@hydra.main(config_path="config", config_name="dynamics/pushT", version_base=None)
 def main(cfg: DictConfig):
     torch.backends.cuda.matmul.allow_tf32 = cfg.train.enable_fast_matmul
     # Setup distributed training
@@ -56,20 +56,6 @@ def main(cfg: DictConfig):
     effective_global_batch = cfg.train.batch_per_gpu * world_size * cfg.train.accum_grad_steps
     if rank == 0:
         print(f"Effective global batch size: {effective_global_batch}")
-
-    # Create models
-    if rank == 0:
-        print("Creating encoder and decoder models...")
-
-    tokenizer = load_tokenizer(cfg, device=device) 
-    if cfg.dynamics_ckpt:
-        print(f"Loading dynamics from: {cfg.dynamics_ckpt}")
-        denoiser = load_denoiser(cfg, device=device, model_key='model')
-    else:
-        denoiser = DenoiserWrapper(cfg)
-    diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
-    tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
-    denoiser = denoiser.to(device, dtype=torch.bfloat16)
 
     train_loader, train_sampler, train_dataset = create_distributed_dataloader(
         data_dir=cfg.dataset.data_dir,
@@ -102,6 +88,18 @@ def main(cfg: DictConfig):
         shuffle=False,    # evaluation: deterministic order
         drop_last=False,  # keep all test windows
     )
+    # Create models
+    if rank == 0:
+        print("Creating encoder and decoder models...")
+    tokenizer = load_tokenizer(cfg, device=device) 
+    if cfg.dynamics_ckpt:
+        print(f"Loading dynamics from: {cfg.dynamics_ckpt}")
+        denoiser = load_denoiser(cfg, device=device, model_key='model')
+    else:
+        denoiser = DenoiserWrapper(cfg)
+    diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
+    tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
+    denoiser = denoiser.to(device, dtype=torch.bfloat16)
 
     # Print parameter counts
     if rank == 0:
@@ -212,6 +210,8 @@ def main(cfg: DictConfig):
     if rank == 0:
         print("Starting warmup iterations...")
 
+    loss_scaler = RMSLossScaler()
+
     # Track statistics
     epoch_times = []
     epoch_losses = []
@@ -254,7 +254,11 @@ def main(cfg: DictConfig):
 
             # Move data to device
             images = batch['image'].to(device, non_blocking=True)  # (B, T, C, H, W)
-            actions = batch['action'].to(device, non_blocking=True)  # (B, T, action_dim)
+            if not cfg.train.video_pretraining:
+                actions = batch['action'].to(device, non_blocking=True)  # (B, T, action_dim)
+            else:
+                actions = torch.zeros(images.shape[0], images.shape[1], cfg.denoiser.n_actions).to(images.device, dtype=images.dtype)
+
             
             if long_seq_sample:
                 B = cfg.train.long_seq_batch_per_gpu
@@ -270,8 +274,6 @@ def main(cfg: DictConfig):
             # Convert to bfloat16
             images = images.to(torch.bfloat16)
             actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions]
-            if True:
-                actions = torch.zeros_like(actions).to(actions.device, dtype=torch.bfloat16)
 
             # Time the training step
             torch.cuda.synchronize(device)
@@ -290,22 +292,29 @@ def main(cfg: DictConfig):
                 flow_loss, bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser, actions=actions)
             # 1. Calculate TOTAL loss for THIS micro-batch
             # Do NOT add to a persistent tensor variable like 'accum_flow' here
-            loss_micro = (flow_loss + bootstrap_loss) / cfg.train.accum_grad_steps
+            flow_loss = flow_loss/cfg.train.accum_grad_steps
+            bootstrap_loss = bootstrap_loss/cfg.train.accum_grad_steps
             
-            # 2. Backward immediately on this specific graph
+            if long_seq_sample:
+                flow_loss_scaled = loss_scaler('long_seq_flow_loss', flow_loss)
+                bootstrap_loss_scaled = loss_scaler('long_seq_shortcut_loss', bootstrap_loss)
+                loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
+            else: 
+                flow_loss_scaled = loss_scaler('short_seq_flow_loss', flow_loss)
+                bootstrap_loss_scaled = loss_scaler('short_seq_shortcut_loss', bootstrap_loss)
+                loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
+
             loss_micro.backward()
             
             # 3. Accumulate values for logging (DETACHED)
-            # Use .item() to ensure you store Python floats, not graph nodes
-
             if not long_seq_sample:
                 accum_flow += flow_loss.item() 
                 accum_shortcut += bootstrap_loss.item()
-                accum_total += (flow_loss.item() + bootstrap_loss.item())
+                accum_total += (flow_loss_scaled.item() + 0.3*bootstrap_loss_scaled.item())
             else:
                 accum_flow_long += flow_loss.item() 
                 accum_shortcut_long += bootstrap_loss.item()
-                accum_total_long += (flow_loss.item() + bootstrap_loss.item())
+                accum_total_long += (flow_loss_scaled.item() + 0.3*bootstrap_loss_scaled.item())
 
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
@@ -323,7 +332,7 @@ def main(cfg: DictConfig):
                     num_updates_long += 1
 
                     if rank == 0:
-                        tb_writer.add_scalar("train/total_loss_long", sync_loss_long, global_update)
+                        tb_writer.add_scalar("train/total_loss_long_normalized", sync_loss_long, global_update)
                         tb_writer.add_scalar("train/flow_loss_long", accum_flow_long / cfg.train.accum_grad_steps, global_update)
                         tb_writer.add_scalar("train/shortcut_loss_long", accum_shortcut_long / cfg.train.accum_grad_steps, global_update)
                 else:
@@ -334,7 +343,7 @@ def main(cfg: DictConfig):
                     num_updates_short += 1
 
                     if rank == 0:
-                        tb_writer.add_scalar("train/total_loss_short", sync_loss, global_update)
+                        tb_writer.add_scalar("train/total_loss_short_normalized", sync_loss, global_update)
                         tb_writer.add_scalar("train/flow_loss_short", accum_flow / cfg.train.accum_grad_steps, global_update)
                         tb_writer.add_scalar("train/shortcut_loss_short", accum_shortcut / cfg.train.accum_grad_steps, global_update)
 

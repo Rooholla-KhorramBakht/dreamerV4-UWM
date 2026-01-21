@@ -3,10 +3,9 @@ defaults:
  - /tokenizer: /pushT
 
 dual_stream: false
-# tokenizer_ckpt: checkpoints/tokenizer_ckpts/soar.pt
 dynamics_ckpt:  checkpoints/dynamics_ckpts/video-pushT-110M.pt
 reload_checkpoint: null
-output_dir: checkpoints/dynamics/pushT/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics/pushT-video/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25
@@ -19,7 +18,7 @@ denoiser:
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
   context_length: 32          # The context length for the dynamics model
-  max_sequence_length: 128      # The maximum temporal horizon of the tokenizer during training
+  max_sequence_length: 32      # The maximum temporal horizon of the tokenizer during training
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 4           # Causal tokenizer encoder depth
@@ -36,7 +35,7 @@ train:
   num_epochs: 100
   batch_per_gpu: 8
   long_seq_batch_per_gpu: 4
-  long_seq_prob: 0.1
+  long_seq_prob: 0.0 
   context_length: 32
   accum_grad_steps: 1
   lr: 1e-4
@@ -46,6 +45,7 @@ train:
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0
+  video_pretraining: true # Set the action to zero in doing video pretraining
 
 wandb:
   enable: true
