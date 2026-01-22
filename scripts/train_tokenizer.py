@@ -380,7 +380,7 @@ def main(cfg: DictConfig):
         tokenizer.to(device)
 
     if cfg.train.use_compile:
-        tokenizer = torch.compile(tokenizer, mode="max-autotune", fullgraph=False)
+        tokenizer = torch.compile(tokenizer, mode="max-autotune-no-cudagraphs", fullgraph=False)
         
     # Print parameter counts
     if rank == 0:

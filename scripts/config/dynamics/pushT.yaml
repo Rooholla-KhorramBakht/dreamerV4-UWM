@@ -35,7 +35,7 @@ train:
   num_epochs: 100
   batch_per_gpu: 8
   long_seq_batch_per_gpu: 4
-  long_seq_prob: 1.0 
+  long_seq_prob: 0.2
   context_length: 32
   accum_grad_steps: 1
   lr: 1e-4

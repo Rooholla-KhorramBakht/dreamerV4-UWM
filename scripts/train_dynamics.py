@@ -304,7 +304,7 @@ def main(cfg: DictConfig):
             else: 
                 flow_loss_scaled = loss_scaler('short_seq_flow_loss', flow_loss)
                 bootstrap_loss_scaled = loss_scaler('short_seq_shortcut_loss', bootstrap_loss)
-                loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)
+                loss_micro = loss_scaler('short_seq_loss', loss_micro_raw)
                 # loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
 
             loss_micro.backward()

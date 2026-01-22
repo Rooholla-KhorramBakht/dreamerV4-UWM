@@ -30,8 +30,8 @@ tokenizer:
 train:
   use_compile: true
   num_epochs: 60
-  batch_per_gpu: 2
-  grad_accum_steps: 2
+  batch_per_gpu: 4
+  grad_accum_steps: 1
   lr: 1e-4
   weight_decay: 0.01
   num_workers: 12
