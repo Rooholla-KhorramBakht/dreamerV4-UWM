@@ -373,10 +373,10 @@ def main(cfg: DictConfig):
      # Todo: Make it cofigurable with hydra
     if cfg.tokenizer_ckpt:
         print(f'Initializing the tokenizer with: {cfg.tokenizer_ckpt}')
-        tokenizer = load_tokenizer(cfg, device=device)
+        tokenizer = load_tokenizer(cfg, device=device, max_num_forward_steps=cfg.tokenizer.max_sequence_length)
         tokenizer.to(device)
     else:
-        tokenizer = TokenizerWrapper(cfg)
+        tokenizer = TokenizerWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
         tokenizer.to(device)
 
     if cfg.train.use_compile:
