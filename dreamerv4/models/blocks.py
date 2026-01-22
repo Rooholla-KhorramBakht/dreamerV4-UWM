@@ -103,7 +103,6 @@ class RopeEmbedding(nn.Module):
             if cos_view.dim() < 4:
                 cos_view = cos_view.unsqueeze(2)
                 sin_view = sin_view.unsqueeze(2)
-                
         # 2. CLONE them to break the dependency on the DDP buffer
         # This ensures that if DDP syncs (overwrites) self.cos_emb later, 
         # the graph uses this safe copy.
@@ -111,6 +110,7 @@ class RopeEmbedding(nn.Module):
         sin_emb = sin_view.clone()
         x1, x2 = x[..., ::2], x[..., 1::2]
         xJ = torch.stack([-x2, x1], dim=-1).reshape_as(x)        
+        # breakpoint()
         x_rot = (x * cos_emb) + (xJ * sin_emb)
         return x_rot
     

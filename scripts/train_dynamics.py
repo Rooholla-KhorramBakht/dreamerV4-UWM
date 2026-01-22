@@ -91,16 +91,16 @@ def main(cfg: DictConfig):
     # Create models
     if rank == 0:
         print("Creating encoder and decoder models...")
-    tokenizer = load_tokenizer(cfg, device=device) 
+    tokenizer = load_tokenizer(cfg, device=device, max_num_forward_steps=cfg.denoiser.max_sequence_length) 
+    
     if cfg.dynamics_ckpt:
         print(f"Loading dynamics from: {cfg.dynamics_ckpt}")
-        denoiser = load_denoiser(cfg, device=device, model_key='model')
+        denoiser = load_denoiser(cfg, device=device, model_key='model', max_num_forward_steps=cfg.denoiser.max_sequence_length)
     else:
-        denoiser = DenoiserWrapper(cfg)
+        denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
     diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
     tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
     denoiser = denoiser.to(device, dtype=torch.bfloat16)
-
     # Print parameter counts
     if rank == 0:
         learnable_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
@@ -286,9 +286,11 @@ def main(cfg: DictConfig):
             # Encode (Frozen)
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    breakpoint()
                     z_clean = tokenizer.encode(images).detach().clone()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                breakpoint()
                 diffused_info = diffuser(z_clean)
                 flow_loss, bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser, actions=actions)
             # 1. Calculate TOTAL loss for THIS micro-batch
