@@ -3,13 +3,13 @@ defaults:
  - /tokenizer: /pushT
 
 dual_stream: false
-dynamics_ckpt:  null #checkpoints/dynamics_ckpts/pushT-110M.pt
+dynamics_ckpt: null 
 reload_checkpoint: null
-output_dir: checkpoints/dynamics/pushT-video/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics/pre-release/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25
-save_every: 10000
+save_every: 2000
 seed: 42
 
 denoiser:
@@ -18,7 +18,7 @@ denoiser:
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
   context_length: 32          # The context length for the dynamics model
-  max_sequence_length: 128      # The maximum temporal horizon of the tokenizer during training
+  max_sequence_length: 64      # The maximum temporal horizon of the tokenizer during training
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 4           # Causal tokenizer encoder depth

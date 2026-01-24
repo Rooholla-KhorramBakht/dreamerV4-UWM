@@ -279,6 +279,7 @@ def main(cfg: DictConfig):
             # Time the training step
             torch.cuda.synchronize(device)
             step_start = time.perf_counter()
+            
             # Forward pass
             # Zero grads at the start of each accumulation window
             if micro_idx == 0:
@@ -291,21 +292,13 @@ def main(cfg: DictConfig):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 diffused_info = diffuser(z_clean)
                 flow_loss, bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser, actions=actions)
-            # 1. Calculate TOTAL loss for THIS micro-batch
-            # Do NOT add to a persistent tensor variable like 'accum_flow' here
-            flow_loss = flow_loss/cfg.train.accum_grad_steps
-            bootstrap_loss = bootstrap_loss/cfg.train.accum_grad_steps
-            loss_micro_raw = flow_loss + bootstrap_loss
-            if long_seq_sample:
-                flow_loss_scaled = loss_scaler('long_seq_flow_loss', flow_loss)
-                bootstrap_loss_scaled = loss_scaler('long_seq_shortcut_loss', bootstrap_loss)
-                loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)
-                # loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
-            else: 
-                flow_loss_scaled = loss_scaler('short_seq_flow_loss', flow_loss)
-                bootstrap_loss_scaled = loss_scaler('short_seq_shortcut_loss', bootstrap_loss)
-                loss_micro = loss_scaler('short_seq_loss', loss_micro_raw)
-                # loss_micro = flow_loss_scaled + 0.3*bootstrap_loss_scaled
+                # 1. Calculate TOTAL loss for THIS micro-batch
+                # Do NOT add to a persistent tensor variable like 'accum_flow' here
+                loss_micro_raw = flow_loss + bootstrap_loss
+                if long_seq_sample:
+                    loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)/cfg.train.accum_grad_steps
+                else: 
+                    loss_micro = loss_scaler('short_seq_loss', loss_micro_raw)/cfg.train.accum_grad_steps
 
             loss_micro.backward()
             
@@ -313,12 +306,12 @@ def main(cfg: DictConfig):
             if not long_seq_sample:
                 accum_flow += flow_loss.item() 
                 accum_shortcut += bootstrap_loss.item()
-                accum_total += (flow_loss_scaled.item() + 0.3*bootstrap_loss_scaled.item())
+                accum_total += loss_micro.item()
             else:
                 accum_flow_long += flow_loss.item() 
                 accum_shortcut_long += bootstrap_loss.item()
-                accum_total_long += (flow_loss_scaled.item() + 0.3*bootstrap_loss_scaled.item())
-
+                accum_total_long += loss_micro.item()
+            
             # If this is the last micro-batch in the window, do optimizer step
             if is_last_micro:
                 torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
@@ -336,8 +329,8 @@ def main(cfg: DictConfig):
 
                     if rank == 0:
                         tb_writer.add_scalar("train/total_loss_long_normalized", sync_loss_long, global_update)
-                        tb_writer.add_scalar("train/flow_loss_long", accum_flow_long / cfg.train.accum_grad_steps, global_update)
-                        tb_writer.add_scalar("train/shortcut_loss_long", accum_shortcut_long / cfg.train.accum_grad_steps, global_update)
+                        tb_writer.add_scalar("train/flow_loss_long", accum_flow_long, global_update)
+                        tb_writer.add_scalar("train/shortcut_loss_long", accum_shortcut_long, global_update)
                 else:
                     total = torch.tensor([accum_total], device=device)
                     dist.all_reduce(total, op=dist.ReduceOp.AVG)
@@ -347,14 +340,15 @@ def main(cfg: DictConfig):
 
                     if rank == 0:
                         tb_writer.add_scalar("train/total_loss_short_normalized", sync_loss, global_update)
-                        tb_writer.add_scalar("train/flow_loss_short", accum_flow / cfg.train.accum_grad_steps, global_update)
-                        tb_writer.add_scalar("train/shortcut_loss_short", accum_shortcut / cfg.train.accum_grad_steps, global_update)
+                        tb_writer.add_scalar("train/flow_loss_short", accum_flow, global_update)
+                        tb_writer.add_scalar("train/shortcut_loss_short", accum_shortcut, global_update)
 
                 if rank == 0:
                     tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_update)
                     tb_writer.add_scalar("train/long_seq_sampled", float(long_seq_sample), global_update)
 
                 long_next = torch.zeros((), device=device, dtype=torch.bool)
+                
                 if rank == 0:
                     # Checkpoint every N updates (within epoch)
                     if global_update % cfg.save_every == 0:
@@ -419,18 +413,17 @@ def main(cfg: DictConfig):
             print(f"  Avg Step Time: {sum(step_times)/len(step_times):.3f}s")
             print(f"{'='*60}\n")
 
-        save_ddp_checkpoint(
-            ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
-            epoch=epoch,
-            global_update=global_update,
-            model=denoiser,
-            optim=optim,
-            scheduler=scheduler,
-            rank=rank,
-            wandb_run_id=wandb_run_id,
-            log_dir=log_dir,
-        )
-
+            save_ddp_checkpoint(
+                ckpt_path=os.path.join(log_dir, f"{global_update}.pt"),
+                epoch=epoch,
+                global_update=global_update,
+                model=denoiser,
+                optim=optim,
+                scheduler=scheduler,
+                rank=rank,
+                wandb_run_id=wandb_run_id,
+                log_dir=log_dir,
+            )
         # Synchronize after each epoch
         dist.barrier()
     
