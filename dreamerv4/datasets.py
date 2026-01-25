@@ -1,5 +1,6 @@
 import h5py
 import torch
+import random
 import json
 from functools import partial
 from torch.utils.data import DataLoader
@@ -383,7 +384,9 @@ class ShardedHDF5Dataset(Dataset):
         split: str = "train",          # "train" or "test"
         train_fraction: float = 0.9,   # fraction of episodes in train
         split_seed: int = 42,          # seed for reproducible split
+        shuffle_windows: bool = True,    
     ):
+        self.shuffle_windows = shuffle_windows
         self.data_dir = Path(data_dir)
         self.window_size = window_size
         self.stride = stride
@@ -443,6 +446,8 @@ class ShardedHDF5Dataset(Dataset):
         self.windows = [w for w in self.windows if (w[0], w[1]) in keep]
         print(f"{self.split.capitalize()} split: {len(self.windows)} windows "
               f"from {len(keep)} episodes")
+        if self.shuffle_windows:
+            random.shuffle(self.windows)
 
     def __len__(self):
         return len(self.windows)
