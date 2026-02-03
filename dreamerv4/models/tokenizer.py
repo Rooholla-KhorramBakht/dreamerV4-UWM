@@ -414,6 +414,5 @@ class TokenizerWrapper(nn.Module):
     def encode(self, images):
         images = (images*2.)-1. # Translate the images in +-1 range
         tokens = self.patchifier(images)
-        masked_tokens = self.masker(tokens)
-        z, _ = self.encoder(masked_tokens)
+        z, _ = self.encoder(tokens)
         return z

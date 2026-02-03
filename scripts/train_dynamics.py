@@ -22,8 +22,6 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed.elastic.multiprocessing.errors import record
 from pathlib import Path
-# torch.autograd.set_detect_anomaly(True)
-# torch.compiler.reset()
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-8):
     def lr_lambda(current_step):
@@ -99,8 +97,10 @@ def main(cfg: DictConfig):
     else:
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
     diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
-    tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
-    denoiser = denoiser.to(device, dtype=torch.bfloat16)
+    # tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
+    # denoiser = denoiser.to(device, dtype=torch.bfloat16)
+    tokenizer = tokenizer.to(device)
+    denoiser = denoiser.to(device)
     # Print parameter counts
     if rank == 0:
         learnable_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)

@@ -18,7 +18,7 @@ denoiser:
   num_latent_tokens: 256      # The number of latent tokens per frame
   num_register_tokens: 4
   context_length: 32          # The context length for the dynamics model
-  max_sequence_length: 64      # The maximum temporal horizon of the tokenizer during training
+  max_sequence_length: 32      # The maximum temporal horizon of the tokenizer during training
   model_dim: 768              # The dimension of the transformer latents
   latent_dim: 32              # The dimention of the encoder output latents (z)
   n_layers: 4           # Causal tokenizer encoder depth
@@ -33,9 +33,9 @@ train:
   device: 'cuda:0'
   use_compile: true
   num_epochs: 100
-  batch_per_gpu: 8
+  batch_per_gpu: 4
   long_seq_batch_per_gpu: 4
-  long_seq_prob: 0.2
+  long_seq_prob: 0.0
   context_length: 32
   accum_grad_steps: 1
   lr: 1e-4
