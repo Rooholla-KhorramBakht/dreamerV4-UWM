@@ -70,7 +70,7 @@ class DreamerV4Denoiser(nn.Module):
         self.num_modality_tokens = cfg.num_action_tokens + \
                                    cfg.num_latent_tokens + \
                                    cfg.num_register_tokens + \
-                                    1 # noise level + shortcut tokens        
+                                    2 # noise level + shortcut tokens (obs + act) that are combined into a single control token each
 
         # --- Transformer layers ---
         self.layers = nn.ModuleList([

@@ -236,12 +236,17 @@ def main(cfg: DictConfig):
         num_updates_short = 0
         num_updates_long = 0
         # Accumulators over the current accumulation window
-        accum_flow = 0.0
-        accum_shortcut = 0.0
-        accum_total = 0.0
-        accum_flow_long = 0.0
-        accum_shortcut_long = 0.0
-        accum_total_long = 0.0
+        accum_obs_flow = 0.0
+        accum_obs_boot = 0.0
+        accum_act_flow = 0.0
+        accum_act_boot = 0.0
+        accum_total    = 0.0
+
+        accum_obs_flow_long = 0.0
+        accum_obs_boot_long = 0.0
+        accum_act_flow_long = 0.0
+        accum_act_boot_long = 0.0
+        accum_total_long    = 0.0
         long_seq_sample = False
 
         for step_idx, batch in enumerate(train_loader):
@@ -289,27 +294,31 @@ def main(cfg: DictConfig):
                     z_clean = tokenizer.encode(images).detach().clone()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                breakpoint()
                 diffused_info = diffuser(z_clean, actions)
                 obs_flow_loss, obs_bootstrap_loss, act_flow_loss, act_bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser)
                 # 1. Calculate TOTAL loss for THIS micro-batch
                 # Do NOT add to a persistent tensor variable like 'accum_flow' here
-                loss_micro_raw = obs_flow_loss + obs_bootstrap_loss + act_flow_loss + act_bootstrap_loss
                 if long_seq_sample:
-                    loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)/cfg.train.accum_grad_steps
+                    loss_micro_obs = loss_scaler('long_seq_obs_loss', obs_flow_loss + obs_bootstrap_loss)/cfg.train.accum_grad_steps
+                    loss_micro_act = loss_scaler('long_seq_act_loss', act_flow_loss + act_bootstrap_loss)/cfg.train.accum_grad_steps
                 else: 
-                    loss_micro = loss_scaler('short_seq_loss', loss_micro_raw)/cfg.train.accum_grad_steps
-
+                    loss_micro_obs = loss_scaler('short_seq_obs_loss', obs_flow_loss + obs_bootstrap_loss)/cfg.train.accum_grad_steps
+                    loss_micro_act = loss_scaler('short_seq_act_loss', act_flow_loss + act_bootstrap_loss)/cfg.train.accum_grad_steps
+                loss_micro = loss_micro_obs + loss_micro_act
             loss_micro.backward()
             
             # 3. Accumulate values for logging (DETACHED)
             if not long_seq_sample:
-                accum_flow += flow_loss.item() 
-                accum_shortcut += bootstrap_loss.item()
+                accum_obs_flow += obs_flow_loss.item() 
+                accum_obs_boot += obs_bootstrap_loss.item()
+                accum_act_flow += act_flow_loss.item()
+                accum_act_boot += act_bootstrap_loss.item()
                 accum_total += loss_micro.item()
             else:
-                accum_flow_long += flow_loss.item() 
-                accum_shortcut_long += bootstrap_loss.item()
+                accum_obs_flow_long += obs_flow_loss.item() 
+                accum_obs_boot_long += obs_bootstrap_loss.item()
+                accum_act_flow_long += act_flow_loss.item()
+                accum_act_boot_long += act_bootstrap_loss.item()
                 accum_total_long += loss_micro.item()
             
             # If this is the last micro-batch in the window, do optimizer step
@@ -328,9 +337,12 @@ def main(cfg: DictConfig):
                     num_updates_long += 1
 
                     if rank == 0:
+                        
                         tb_writer.add_scalar("train/total_loss_long_normalized", sync_loss_long, global_update)
-                        tb_writer.add_scalar("train/flow_loss_long", accum_flow_long, global_update)
-                        tb_writer.add_scalar("train/shortcut_loss_long", accum_shortcut_long, global_update)
+                        tb_writer.add_scalar("train/obs_flow_loss_long", accum_obs_flow_long, global_update)
+                        tb_writer.add_scalar("train/obs_bootstrap_loss_long", accum_obs_boot_long, global_update)
+                        tb_writer.add_scalar("train/act_flow_loss_long", accum_act_flow_long, global_update)
+                        tb_writer.add_scalar("train/act_bootstrap_loss_long", accum_act_boot_long, global_update)
                 else:
                     total = torch.tensor([accum_total], device=device)
                     dist.all_reduce(total, op=dist.ReduceOp.AVG)
@@ -339,9 +351,12 @@ def main(cfg: DictConfig):
                     num_updates_short += 1
 
                     if rank == 0:
+                        
                         tb_writer.add_scalar("train/total_loss_short_normalized", sync_loss, global_update)
-                        tb_writer.add_scalar("train/flow_loss_short", accum_flow, global_update)
-                        tb_writer.add_scalar("train/shortcut_loss_short", accum_shortcut, global_update)
+                        tb_writer.add_scalar("train/obs_flow_loss_short", accum_obs_flow, global_update)
+                        tb_writer.add_scalar("train/obs_bootstrap_loss_short", accum_obs_boot, global_update)
+                        tb_writer.add_scalar("train/act_flow_loss_short", accum_act_flow, global_update)
+                        tb_writer.add_scalar("train/act_bootstrap_loss_short", accum_act_boot, global_update)
 
                 if rank == 0:
                     tb_writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_update)
@@ -371,11 +386,16 @@ def main(cfg: DictConfig):
                 long_seq_sample = bool(long_next.item())
 
                 # Reset accumulators for next accumulation window
-                accum_flow = 0.0
-                accum_shortcut = 0.0
+                
+                accum_obs_flow = 0.0
+                accum_obs_boot = 0.0
+                accum_act_flow = 0.0
+                accum_act_boot = 0.0
                 accum_total = 0.0
-                accum_flow_long = 0.0
-                accum_shortcut_long = 0.0
+                accum_obs_flow_long = 0.0
+                accum_obs_boot_long = 0.0
+                accum_act_flow_long = 0.0
+                accum_act_boot_long = 0.0
                 accum_total_long = 0.0
 
             torch.cuda.synchronize(device)
