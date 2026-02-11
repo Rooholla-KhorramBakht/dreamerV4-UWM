@@ -2,9 +2,9 @@
 defaults:
  - /dataset: pushT
 
-reload_checkpoint: /home/mim-server/projects/rooholla/dreamer-v4-draft/checkpoints/tokenizer_ckpts/pushT.pt
-tokenizer_ckpt: checkpoints/tokenizer_ckpts/pushT/2026-01-21_00-43-43/24000.pt
-output_dir: checkpoints/tokenizer_ckpts/pushT/${now:%Y-%m-%d_%H-%M-%S}
+reload_checkpoint: null
+tokenizer_ckpt: /home/mim-server/projects/rooholla/dreamerV4-UWM/checkpoints/tokenizer_ckpts/pushT.pt
+output_dir: checkpoints/tokenizer/pushT/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25

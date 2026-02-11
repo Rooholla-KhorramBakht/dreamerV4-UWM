@@ -98,7 +98,6 @@ def main(cfg: DictConfig):
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
     diffuser = ForwardDiffusionWithShortcut(num_noise_levels=cfg.denoiser.num_noise_levels)
     # tokenizer = tokenizer.to(device, dtype=torch.bfloat16)
-    # denoiser = denoiser.to(device, dtype=torch.bfloat16)
     tokenizer = tokenizer.to(device)
     denoiser = denoiser.to(device)
     # Print parameter counts
@@ -290,11 +289,12 @@ def main(cfg: DictConfig):
                     z_clean = tokenizer.encode(images).detach().clone()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                diffused_info = diffuser(z_clean)
-                flow_loss, bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser, actions=actions)
+                breakpoint()
+                diffused_info = diffuser(z_clean, actions)
+                obs_flow_loss, obs_bootstrap_loss, act_flow_loss, act_bootstrap_loss = compute_bootstrap_diffusion_loss(diffused_info, denoiser)
                 # 1. Calculate TOTAL loss for THIS micro-batch
                 # Do NOT add to a persistent tensor variable like 'accum_flow' here
-                loss_micro_raw = flow_loss + bootstrap_loss
+                loss_micro_raw = obs_flow_loss + obs_bootstrap_loss + act_flow_loss + act_bootstrap_loss
                 if long_seq_sample:
                     loss_micro = loss_scaler('long_seq_loss', loss_micro_raw)/cfg.train.accum_grad_steps
                 else: 

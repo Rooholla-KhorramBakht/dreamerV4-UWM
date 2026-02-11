@@ -5,7 +5,7 @@ defaults:
 dual_stream: false
 dynamics_ckpt: null 
 reload_checkpoint: null
-output_dir: checkpoints/dynamics/pre-release/${now:%Y-%m-%d_%H-%M-%S}
+output_dir: checkpoints/dynamics/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
 print_every: 100
 log_every: 25
@@ -49,5 +49,5 @@ train:
 
 wandb:
   enable: true
-  project: "dreamer-v4-dynamics"
+  project: "UWM-dynamics"
   run_name: null
