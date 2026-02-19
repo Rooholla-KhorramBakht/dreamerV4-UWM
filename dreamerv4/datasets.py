@@ -384,7 +384,8 @@ class ShardedHDF5Dataset(Dataset):
         split: str = "train",          # "train" or "test"
         train_fraction: float = 0.9,   # fraction of episodes in train
         split_seed: int = 42,          # seed for reproducible split
-        shuffle_windows: bool = True,    
+        shuffle_windows: bool = True, 
+        static_prob: float = 0.1,      # probability of applying no-motion augmentation   
     ):
         self.shuffle_windows = shuffle_windows
         self.data_dir = Path(data_dir)
@@ -393,7 +394,7 @@ class ShardedHDF5Dataset(Dataset):
         self.split = split
         self.train_fraction = train_fraction
         self.split_seed = split_seed
-
+        self.static_prob = static_prob
         # Load metadata
         with open(self.data_dir / 'metadata.json', 'r') as f:
             self.metadata = json.load(f)
@@ -467,6 +468,10 @@ class ShardedHDF5Dataset(Dataset):
         images = torch.from_numpy(images).float() / 255.0
         images = images.permute(0, 3, 1, 2)
         actions = torch.from_numpy(actions)
+
+        if torch.rand(1).item() < self.static_prob:  # chance to apply no-motion augmentation
+            images[:, ...] = images[0, ...]  # Broadcast first frame for no motion augmentation
+            actions = torch.zeros_like(actions)  # Zero out actions for no motion augmentation
         
         return {'image': images, 'action': actions}
 
