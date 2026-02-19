@@ -43,6 +43,7 @@ class DreamerV4DenoiserCfg:
     num_noise_levels: int = 32                # finest grid size for τ (must be power of 2)
     n_actions: int = 0  # number of action components
     dual_stream: bool = False
+    is_causal: bool = False  # whether to use causal masking in the transformer (should be False for standard denoising, True for stepwise inference)
 
 class DreamerV4Denoiser(nn.Module):
     """
@@ -82,7 +83,8 @@ class DreamerV4Denoiser(nn.Module):
                 qk_norm=cfg.qk_norm,
                 modality_dim_max_seq_len=self.num_modality_tokens,
                 temporal_dim_max_seq_len= (max_num_forward_steps if max_num_forward_steps is not None else cfg.max_sequence_length),   
-                context_length=cfg.context_length,             
+                context_length=cfg.context_length,    
+                is_causal=cfg.is_causal,         
             )
             for _ in range(cfg.n_layers)
         ])

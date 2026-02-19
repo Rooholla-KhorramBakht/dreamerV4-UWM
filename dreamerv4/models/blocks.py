@@ -419,8 +419,8 @@ class EfficientTransformerLayer(nn.Module):
     ):
         super().__init__()
         assert isinstance(layer_type, LayerType)
-        if layer_type == LayerType.TEMPORAL:
-            assert is_causal, "Currently only causal layers are implemented. The temoral attention layer will need to be fixed in the future for non-causal modeling."
+        #if layer_type == LayerType.TEMPORAL:
+        #    assert is_causal, "Currently only causal layers are implemented. The temoral attention layer will need to be fixed in the future for non-causal modeling."
 
         self.layer_type = layer_type
         self.model_dim = model_dim
@@ -470,7 +470,7 @@ class EfficientTransformerLayer(nn.Module):
         h = self.norm1(x)
         if self.layer_type == LayerType.TEMPORAL:
             T = h.shape[1]
-            if (kv_cache is None) and (self.context_length is not None) and (self.context_length < T):
+            if (kv_cache is None) and (self.context_length is not None) and (self.context_length < T) and self.is_causal:
                 temporal_mask = create_temporal_window_mask(
                     T=T,
                     context_length=self.context_length,
