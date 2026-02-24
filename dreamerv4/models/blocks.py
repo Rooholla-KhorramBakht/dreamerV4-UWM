@@ -225,8 +225,8 @@ class Attention(nn.Module):
              is_causal = False
         else:
              is_causal = causal
-        if mask is not None and mask.dtype not in (torch.bool, torch.float32, torch.float16, torch.bfloat16):
-            mask = mask.to(torch.bool)
+        # if mask is not None and mask.dtype not in (torch.bool, torch.float32, torch.float16, torch.bfloat16):
+        #     mask = mask.to(torch.bool)
         B, T_q, _ = q.shape
         B, T_k, _ = k.shape
         Q = self.W_q(q) # BxTxd
@@ -537,7 +537,7 @@ class EfficientTransformerBlock(nn.Module):
         if layer_types is None:
             layer_types = [
                 LayerType.SPATIAL,
-                LayerType.SPATIAL,
+                LayerType.TEMPORAL,
                 LayerType.SPATIAL,
                 LayerType.TEMPORAL,
             ]

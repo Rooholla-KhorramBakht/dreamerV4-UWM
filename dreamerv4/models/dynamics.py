@@ -7,6 +7,83 @@ import torch.nn as nn
 from .blocks import EfficientTransformerBlock
 from omegaconf import DictConfig, OmegaConf
 
+import torch
+def build_spatial_attention_mask(n_latent: int, n_register: int, n_image_control: int, n_action_control: int, n_action: int) -> torch.Tensor:
+    """
+    Builds the spatial attention mask for one frame of the unified world model.
+    
+    Token sequence order: [Z (latent), Reg (register), IC (image control), AC (action control), A (action)]
+    
+    Mask convention: True = CAN attend, False = CANNOT attend (will be converted to -inf in attention)
+    
+    Rules:
+        - Z    attends to: Z, Reg, IC         (state group sees state + its own noise level)
+        - Reg  attends to: Z, Reg, IC         (scratchpad is part of state group)
+        - IC   attends to: IC                 (control token, fixed input)
+        - AC   attends to: AC                 (control token, fixed input)
+        - A    attends to: Z, Reg, IC, AC, A  (policy sees everything except it cannot affect state)
+    
+    Args:
+        n_latent:        number of image latent tokens (Z)
+        n_register:      number of register tokens (Reg)
+        n_image_control: number of image diffusion control tokens (IC), typically 1
+        n_action_control:number of action diffusion control tokens (AC), typically 1
+        n_action:        number of action tokens (A)
+    
+    Returns:
+        mask: BoolTensor of shape [N, N] where N = sum of all token counts.
+              True  = allowed to attend.
+              False = blocked (will be -inf in softmax).
+    """
+    n_total = n_latent + n_register + n_image_control + n_action_control + n_action
+
+    # Compute slice indices for each group
+    z_start,   z_end   = 0,                                    n_latent
+    reg_start, reg_end = z_end,                                z_end   + n_register
+    ic_start,  ic_end  = reg_end,                              reg_end + n_image_control
+    ac_start,  ac_end  = ic_end,                               ic_end  + n_action_control
+    a_start,   a_end   = ac_end,                               ac_end  + n_action
+
+    # Start fully blocked
+    mask_bool = torch.zeros(n_total, n_total, dtype=torch.bool)
+
+    # Helper to open a block in the mask: rows [r0:r1] can attend to cols [c0:c1]
+    def allow(r0, r1, c0, c1):
+        mask_bool[r0:r1, c0:c1] = True
+    # --- State Group (Z, Reg) ---
+    # Z attends to: Z, Reg, IC
+    allow(z_start,   z_end,   z_start,   z_end)    # Z   -> Z
+    allow(z_start,   z_end,   reg_start, reg_end)   # Z   -> Reg
+    allow(z_start,   z_end,   ic_start,  ic_end)    # Z   -> IC
+
+    # Reg attends to everything
+    allow(reg_start, reg_end, z_start,   z_end)     # Reg -> Z
+    allow(reg_start, reg_end, reg_start, reg_end)   # Reg -> Reg
+    allow(reg_start, reg_end, ic_start,  ic_end)    # Reg -> IC
+    allow(reg_start, reg_end, ac_start,  ac_end)    # Reg -> AC
+    allow(reg_start, reg_end, a_start,   a_end)     # Reg -> A
+
+    # --- Control Tokens ---
+    # IC attends to: IC only
+    allow(ic_start,  ic_end,  ic_start,  ic_end)    # IC  -> IC
+
+    # AC attends to: AC only
+    allow(ac_start,  ac_end,  ac_start,  ac_end)    # AC  -> AC
+
+    # --- Action Group (A) ---
+    # A attends to: Z, Reg, IC, AC, A  (policy sees full state + both noise levels + itself)
+    allow(a_start,   a_end,   z_start,   z_end)     # A   -> Z
+    allow(a_start,   a_end,   reg_start, reg_end)   # A   -> Reg
+    allow(a_start,   a_end,   ic_start,  ic_end)    # A   -> IC
+    allow(a_start,   a_end,   ac_start,  ac_end)    # A   -> AC
+    allow(a_start,   a_end,   a_start,   a_end)     # A   -> A
+    mask_float = torch.zeros_like(mask_bool, dtype=torch.float32)
+    # block where false, allow where true
+    mask_float[mask_bool] = 0.0    # allowed attend = 0.
+    mask_float[~mask_bool] = float('-inf')  # blocked attend = -inf
+    return mask_float
+
+
 class DiscreteEmbedder(nn.Module):
     def __init__(self, n_states, n_dim):
         super().__init__()
@@ -100,6 +177,14 @@ class DreamerV4Denoiser(nn.Module):
         self.action_input_proj = nn.Linear(cfg.n_actions, cfg.model_dim)
         # Initialize learnable tokens
         nn.init.normal_(self.register_tokens, std=0.02)
+        dynamics_spatial_mask = build_spatial_attention_mask(
+            n_latent=cfg.num_latent_tokens,
+            n_register=cfg.num_register_tokens,
+            n_image_control=1,
+            n_action_control=1,
+            n_action=cfg.num_action_tokens,
+        )
+        self.register_buffer("dynamics_spatial_mask", dynamics_spatial_mask, persistent=False)
 
     def forward(
         self,
@@ -150,7 +235,7 @@ class DreamerV4Denoiser(nn.Module):
 
         # --- Transformer dynamics ---
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, spatial_mask=self.dynamics_spatial_mask)
 
         # --- Project back to latent dim, return only latent slice ---
         # x: (B, T, N_lat + S_r + 1 + S_a, D_model) -> (B, T, N_lat + ..., D_latent)

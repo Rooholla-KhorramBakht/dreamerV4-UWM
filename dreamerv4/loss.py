@@ -37,21 +37,31 @@ class ForwardDiffusionWithShortcut(nn.Module):
         self.max_pow2 = int(math.log2(self.num_noise_levels))
         self.d_min = 1.0 / float(self.num_noise_levels)
 
-    def sample_step_noise(self, batch_size, seq_len, device):
+    def sample_step_noise(self, batch_size, seq_len, device, step_index=None, uniform_noise=False):
         B, T = batch_size, seq_len
 
-        step_index_raw = torch.randint(
-            low=0,
-            high=self.max_pow2 + 1,
+        if step_index is None:
+            step_index_raw = torch.randint(
+                low=0,
+                high=self.max_pow2 + 1,
             size=(B, T),
             device=device,
             dtype=torch.long,
         )
+        else:
+            # step_index is provided as (B,T) in [0, max_pow2], so we clamp and use directly
+            step_index_raw = step_index
+            
 
         step = 1.0 / (2.0 ** step_index_raw.float())     # (B,T)
         step_index = self.max_pow2 - step_index_raw      # (B,T)
 
         num_levels = (2 ** step_index_raw).float()
+        if not uniform_noise:
+            m = torch.floor(torch.rand(B, T, device=device) * num_levels).long()
+        else:
+            m = torch.floor(torch.rand(B, 1, device=device) * num_levels).long().expand(B, T)  # same noise across time steps for each batch
+            
         m = torch.floor(torch.rand(B, T, device=device) * 0.9999 * num_levels).long()
 
         tau = m.float() * step                           # (B,T)
@@ -70,6 +80,7 @@ class ForwardDiffusionWithShortcut(nn.Module):
             step_index=step_index,
             half_step_index=half_step_index,
             tau_plus_half_index=tau_plus_half_index,
+            step_index_raw=step_index_raw,
         )
 
     @staticmethod
@@ -84,8 +95,6 @@ class ForwardDiffusionWithShortcut(nn.Module):
         a_clean: torch.Tensor,     # (B, T, n_actions)   (raw actions from dataset)
         *,
         action_noise_std: float = 1.0,
-        action_clip: float | None = None,
-        separate_action_schedule: bool = False,
     ):
         B, T, N_lat, D_lat = z_clean.shape
         device = z_clean.device
@@ -94,7 +103,7 @@ class ForwardDiffusionWithShortcut(nn.Module):
         a_clean_tok = a_clean.unsqueeze(-2)  # (B, T, 1, n_actions)
 
         obs_diff = self.sample_step_noise(B, T, device)
-        act_diff = self.sample_step_noise(B, T, device) if separate_action_schedule else obs_diff
+        act_diff = self.sample_step_noise(B, T, device, obs_diff['step_index_raw'], uniform_noise=True)  # unifrom nose accross the time dimension for actions
 
         # noisy obs
         z0 = torch.randn_like(z_clean)
@@ -103,8 +112,6 @@ class ForwardDiffusionWithShortcut(nn.Module):
         # noisy actions (in tokenized shape)
         a0 = action_noise_std * torch.randn_like(a_clean_tok)
         a_tau = self._mix_tau(a0, a_clean_tok, act_diff["tau"])
-        if action_clip is not None:
-            a_tau = torch.clamp(a_tau, -action_clip, action_clip)
 
         return {
             # obs
@@ -132,7 +139,6 @@ class ForwardDiffusionWithShortcut(nn.Module):
             "num_noise_levels": self.num_noise_levels,
         }
 
-import torch
 
 def compute_bootstrap_diffusion_loss(
     info: dict,

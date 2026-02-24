@@ -385,7 +385,7 @@ class ShardedHDF5Dataset(Dataset):
         train_fraction: float = 0.9,   # fraction of episodes in train
         split_seed: int = 42,          # seed for reproducible split
         shuffle_windows: bool = True, 
-        static_prob: float = 0.1,      # probability of applying no-motion augmentation   
+        static_prob: float = 0.0,      # probability of applying no-motion augmentation   
     ):
         self.shuffle_windows = shuffle_windows
         self.data_dir = Path(data_dir)
