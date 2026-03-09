@@ -5,7 +5,7 @@ import torch.nn as nn
 from .models.dynamics import DreamerV4Denoiser
 import torch.distributed as dist
 
-
+# Flowmatching with shortcut (To implement correctly)
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
     """
     Eq. (8): w(τ) = 0.9 τ + 0.1
@@ -14,11 +14,6 @@ def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
     returns: same shape as tau
     """
     return 0.9 * tau + 0.1
-
-
-# ------------------------------------------------------------
-# 5. Forward diffusion with per-frame (τ_t, d_t)
-# ------------------------------------------------------------
 
 class ForwardDiffusionWithShortcut(nn.Module):
     """
@@ -138,7 +133,6 @@ class ForwardDiffusionWithShortcut(nn.Module):
             "d_min": self.d_min,
             "num_noise_levels": self.num_noise_levels,
         }
-
 
 def compute_bootstrap_diffusion_loss(
     info: dict,
@@ -262,7 +256,115 @@ def compute_bootstrap_diffusion_loss(
 
     return obs_flow_loss, obs_bootstrap_loss, act_flow_loss, act_bootstrap_loss
 
+# Flowmatching without shortcut learning
+class FlowMatchingForwardProcess(nn.Module):
+    """
+    Dyadic shortcut schedule for BOTH:
+      - obs latents z: (B, T, N_lat, D_lat)
+      - actions a:     (B, T, 1, n_actions)   (we enforce num_action_tokens=1)
 
+    Forward mixing:
+      x_tau = (1 - tau) * x0 + tau * x_clean
+    """
+
+    def __init__(self, 
+                 max_diff_steps=32,
+                action_noise_std: float = 1.,
+                device='cpu'):
+        super().__init__()
+        self.max_diff_steps = max_diff_steps
+        self.device = device
+        self.action_noise_std = action_noise_std
+
+    def sample_step_noise(self, batch_size, seq_len, context_length=None):
+        B, T = batch_size, seq_len
+        # Diffusion forcing noise level
+        tau_d = torch.randint(0, self.max_diff_steps, (B,T)).to(self.device)
+        tau = tau_d/self.max_diff_steps
+        
+        if context_length is not None:
+            tau[:, :context_length] =  0.9999                     # lownoise for the context 
+            tau[:, context_length:] =  tau[:, context_length] # the same noise added to prediction chunk
+
+        
+        tau_idx = (tau*self.max_diff_steps).to(torch.long)
+        
+        return dict(
+            tau=tau,
+            tau_idx = tau_idx.to(self.device),
+        )
+
+    def forward(
+        self,
+        z_clean: torch.Tensor,     # (B, T, N_lat, D_lat)
+        a_clean: torch.Tensor,     # (B, T, N_act_tokens, n_actions)   (raw actions from dataset)
+        context_length = None,
+    ):
+        B, T, N_lat, D_lat = z_clean.shape
+        device = z_clean.device
+        obs_diff = self.sample_step_noise(B, T, context_length=context_length)
+        act_diff = self.sample_step_noise(B, T, context_length=context_length)  
+        
+        # observation forward diffusion
+        z0 = torch.randn_like(z_clean)
+        obs_tau = obs_diff["tau"].unsqueeze(-1).unsqueeze(-1)  # (B,T,1,1)
+        z_tau = (1. - obs_tau) * z0 + obs_tau * z_clean
+
+        # action forward diffusion
+        a0 = self.action_noise_std * torch.randn_like(a_clean)
+        act_tau = act_diff["tau"].unsqueeze(-1).unsqueeze(-1)  # (B,T,1,1)
+        a_tau = (1. - act_tau) * a0 + act_tau * a_clean
+
+        return {
+            # obs
+            "x": z_clean,
+            "x0": z0,
+            "x_tau": z_tau,
+            "obs_tau": obs_diff["tau"],
+            "obs_tau_idx": obs_diff["tau_idx"],
+            # act
+            "a": a_clean,
+            "a0": a0,
+            "a_tau": a_tau,
+            "act_tau": act_diff["tau"],
+            "act_tau_idx": act_diff["tau_idx"],
+        }
+
+def compute_flowmatching_loss(
+    info: dict,
+    denoiser: DreamerV4Denoiser,
+    device='cpu', 
+):
+    
+    # --- obs ---
+    x = info["x"]
+    B, T, N_lat, D_lat = x.shape
+    x_tau = info["x_tau"]
+    obs_tau_idx = info["obs_tau_idx"]
+
+    # --- act (S_a = 1) ---
+    a = info["a"]         # (B,T,1,n_actions)
+    a_tau = info["a_tau"] # (B,T,1,n_actions)
+    act_tau_idx = info["act_tau_idx"]  # (B, T)
+
+    step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
+
+    z_hat, a_hat = denoiser(
+        noisy_act=a_tau.squeeze(-2),  # (B,T,A) — denoiser expects (B,T,n_actions)
+        noisy_obs=x_tau,
+        obs_sigma_idx=obs_tau_idx,
+        obs_step_idx=step_idx,
+        act_sigma_idx=act_tau_idx,
+        act_step_idx=step_idx,
+    )  # a_hat: (B,T,1,A)
+
+    # X-prediction targets: directly regress clean signal
+    obs_x_target = x                    # (B, T, N_lat, D_lat)
+    act_x_target = a                    # (B, T, 1, n_actions)
+
+    obs_flow_loss = (z_hat - obs_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    act_flow_loss = (a_hat - act_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    return obs_flow_loss, act_flow_loss
 class RMSLossScaler:
     """
     Tracks running RMS for named losses and returns normalized losses.
