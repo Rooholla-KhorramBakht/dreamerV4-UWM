@@ -284,7 +284,7 @@ class FlowMatchingForwardProcess(nn.Module):
         
         if context_length is not None:
             tau[:, :context_length] =  0.9999                     # lownoise for the context 
-            tau[:, context_length:] =  tau[:, context_length] # the same noise added to prediction chunk
+            tau[:, context_length:] = tau[:, context_length].unsqueeze(-1)  # same noise level across prediction chunk
 
         
         tau_idx = (tau*self.max_diff_steps).to(torch.long)
