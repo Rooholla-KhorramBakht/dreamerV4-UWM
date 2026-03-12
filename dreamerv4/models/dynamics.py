@@ -4,7 +4,7 @@ from typing import Optional, List
 from .blocks import create_temporal_mask
 import torch
 import torch.nn as nn
-from .blocks import EfficientTransformerBlock
+from .blocks import EfficientTransformerBlock, LayerType
 from omegaconf import DictConfig, OmegaConf
 
 import torch
@@ -149,7 +149,12 @@ class DreamerV4Denoiser(nn.Module):
                                    cfg.num_latent_tokens + \
                                    cfg.num_register_tokens + \
                                     2 # noise level + shortcut tokens (obs + act) that are combined into a single control token each
-
+        self.layer_types = [
+                LayerType.SPATIAL,
+                LayerType.TEMPORAL,
+                LayerType.SPATIAL,
+                LayerType.TEMPORAL,
+            ]
         # --- Transformer layers ---
         self.layers = nn.ModuleList([
             EfficientTransformerBlock(
@@ -161,7 +166,8 @@ class DreamerV4Denoiser(nn.Module):
                 modality_dim_max_seq_len=self.num_modality_tokens,
                 temporal_dim_max_seq_len= (max_num_forward_steps if max_num_forward_steps is not None else cfg.max_sequence_length),   
                 context_length=cfg.context_length,    
-                is_causal=cfg.is_causal,         
+                is_causal=cfg.is_causal,   
+                layer_types=self.layer_types     
             )
             for _ in range(cfg.n_layers)
         ])

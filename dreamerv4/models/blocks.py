@@ -537,7 +537,7 @@ class EfficientTransformerBlock(nn.Module):
         if layer_types is None:
             layer_types = [
                 LayerType.SPATIAL,
-                LayerType.TEMPORAL,
+                LayerType.SPATIAL,
                 LayerType.SPATIAL,
                 LayerType.TEMPORAL,
             ]
