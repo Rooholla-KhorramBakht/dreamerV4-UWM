@@ -5,258 +5,17 @@ import torch.nn as nn
 from .models.dynamics import DreamerV4Denoiser
 import torch.distributed as dist
 
-# Flowmatching with shortcut (To implement correctly)
+
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
     """
     Eq. (8): w(τ) = 0.9 τ + 0.1
 
-    tau: (B, T) or (B, T, 1, 1)
+    tau: (B, T) or broadcastable shape
     returns: same shape as tau
     """
     return 0.9 * tau + 0.1
 
-class ForwardDiffusionWithShortcut(nn.Module):
-    """
-    Dyadic shortcut schedule for BOTH:
-      - obs latents z: (B, T, N_lat, D_lat)
-      - actions a:     (B, T, 1, n_actions)   (we enforce num_action_tokens=1)
 
-    Forward mixing:
-      x_tau = (1 - tau) * x0 + tau * x_clean
-    """
-
-    def __init__(self, num_noise_levels=32):
-        super().__init__()
-        assert (num_noise_levels & (num_noise_levels - 1)) == 0, "num_noise_levels must be a power of 2"
-        self.num_noise_levels = int(num_noise_levels)
-        self.max_pow2 = int(math.log2(self.num_noise_levels))
-        self.d_min = 1.0 / float(self.num_noise_levels)
-
-    def sample_step_noise(self, batch_size, seq_len, device, step_index=None, uniform_noise=False):
-        B, T = batch_size, seq_len
-
-        if step_index is None:
-            step_index_raw = torch.randint(
-                low=0,
-                high=self.max_pow2 + 1,
-            size=(B, T),
-            device=device,
-            dtype=torch.long,
-        )
-        else:
-            # step_index is provided as (B,T) in [0, max_pow2], so we clamp and use directly
-            step_index_raw = step_index
-            
-
-        step = 1.0 / (2.0 ** step_index_raw.float())     # (B,T)
-        step_index = self.max_pow2 - step_index_raw      # (B,T)
-
-        num_levels = (2 ** step_index_raw).float()
-        if not uniform_noise:
-            m = torch.floor(torch.rand(B, T, device=device) * num_levels).long()
-        else:
-            m = torch.floor(torch.rand(B, 1, device=device) * num_levels).long().expand(B, T)  # same noise across time steps for each batch
-            
-        m = torch.floor(torch.rand(B, T, device=device) * 0.9999 * num_levels).long()
-
-        tau = m.float() * step                           # (B,T)
-        tau_index = m * (2 ** step_index)                # (B,T)
-
-        stride_full = (2 ** step_index)
-        delta_tau_index = stride_full // 2
-
-        tau_plus_half_index = torch.clamp(tau_index + delta_tau_index, 0, self.num_noise_levels - 1)
-        half_step_index = torch.clamp(step_index - 1, min=0)
-
-        return dict(
-            tau=tau,
-            step=step,
-            tau_index=tau_index,
-            step_index=step_index,
-            half_step_index=half_step_index,
-            tau_plus_half_index=tau_plus_half_index,
-            step_index_raw=step_index_raw,
-        )
-
-    @staticmethod
-    def _mix_tau(x0: torch.Tensor, x1: torch.Tensor, tau_bt: torch.Tensor) -> torch.Tensor:
-        expand_shape = [tau_bt.shape[0], tau_bt.shape[1]] + [1] * (x1.ndim - 2)
-        tau = tau_bt.view(*expand_shape).to(dtype=x1.dtype)
-        return (1.0 - tau) * x0 + tau * x1
-
-    def forward(
-        self,
-        z_clean: torch.Tensor,     # (B, T, N_lat, D_lat)
-        a_clean: torch.Tensor,     # (B, T, n_actions)   (raw actions from dataset)
-        *,
-        action_noise_std: float = 1.0,
-    ):
-        B, T, N_lat, D_lat = z_clean.shape
-        device = z_clean.device
-
-        # enforce token dim = 1 for actions
-        a_clean_tok = a_clean.unsqueeze(-2)  # (B, T, 1, n_actions)
-
-        obs_diff = self.sample_step_noise(B, T, device)
-        act_diff = self.sample_step_noise(B, T, device, obs_diff['step_index_raw'], uniform_noise=True)  # unifrom nose accross the time dimension for actions
-
-        # noisy obs
-        z0 = torch.randn_like(z_clean)
-        z_tau = self._mix_tau(z0, z_clean, obs_diff["tau"])
-
-        # noisy actions (in tokenized shape)
-        a0 = action_noise_std * torch.randn_like(a_clean_tok)
-        a_tau = self._mix_tau(a0, a_clean_tok, act_diff["tau"])
-
-        return {
-            # obs
-            "x": z_clean,
-            "x_tau": z_tau,
-            "obs_tau": obs_diff["tau"],
-            "obs_step": obs_diff["step"],
-            "obs_tau_index": obs_diff["tau_index"],
-            "obs_step_index": obs_diff["step_index"],
-            "obs_half_step_index": obs_diff["half_step_index"],
-            "obs_tau_plus_half_index": obs_diff["tau_plus_half_index"],
-
-            # act (kept as tokens with S_a = 1)
-            "a": a_clean_tok,     # (B,T,1,n_actions)
-            "a_tau": a_tau,       # (B,T,1,n_actions)
-            "act_tau": act_diff["tau"],
-            "act_step": act_diff["step"],
-            "act_tau_index": act_diff["tau_index"],
-            "act_step_index": act_diff["step_index"],
-            "act_half_step_index": act_diff["half_step_index"],
-            "act_tau_plus_half_index": act_diff["tau_plus_half_index"],
-
-            # constants
-            "d_min": self.d_min,
-            "num_noise_levels": self.num_noise_levels,
-        }
-
-def compute_bootstrap_diffusion_loss(
-    info: dict,
-    denoiser: DreamerV4Denoiser,
-):
-    # --- obs ---
-    x = info["x"]
-    x_tau = info["x_tau"]
-    obs_tau = info["obs_tau"]
-    obs_step = info["obs_step"]
-    obs_tau_index = info["obs_tau_index"]
-    obs_step_index = info["obs_step_index"]
-    obs_half_step_index = info["obs_half_step_index"]
-    obs_tau_plus_half_index = info["obs_tau_plus_half_index"]
-
-    # --- act (S_a = 1) ---
-    a = info["a"]         # (B,T,1,n_actions)
-    a_tau = info["a_tau"] # (B,T,1,n_actions)
-    act_tau = info["act_tau"]
-    act_step = info["act_step"]
-    act_tau_index = info["act_tau_index"]
-    act_step_index = info["act_step_index"]
-    act_half_step_index = info["act_half_step_index"]
-    act_tau_plus_half_index = info["act_tau_plus_half_index"]
-
-    B, T, N_lat, D_lat = x.shape
-
-    # broadcast for obs
-    obs_tau_b = obs_tau.view(B, T, 1, 1)
-    obs_step_b = obs_step.view(B, T, 1, 1)
-
-    # broadcast for act (a is (B,T,1,A) => make (B,T,1,1))
-    act_tau_b = act_tau.view(B, T, 1, 1)
-    act_step_b = act_step.view(B, T, 1, 1)
-
-    x_tau_detached = x_tau.detach()
-    a_tau_detached = a_tau.detach()
-
-    # =================================================
-    # 1) Bootstrap Target Calculation
-    # =================================================
-    with torch.no_grad():
-        denoiser.eval()
-
-        # pass noisy_act as (B,T,n_actions) because denoiser expects that
-        f1_obs, f1_act = denoiser(
-            noisy_act=a_tau_detached.squeeze(-2),     # (B,T,A)
-            noisy_obs=x_tau_detached,                 # (B,T,N_lat,D_lat)
-            obs_sigma_idx=obs_tau_index,
-            obs_step_idx=obs_half_step_index,
-            act_sigma_idx=act_tau_index,
-            act_step_idx=act_half_step_index,
-        )  # f1_act: (B,T,1,A)
-
-        # ---- obs bootstrap target ----
-        b1_obs = (f1_obs - x_tau) / (1.0 - obs_tau_b)
-        z_prime = x_tau + b1_obs * (obs_step_b / 2.0)
-
-        # ---- act bootstrap target ----
-        b1_act = (f1_act - a_tau) / (1.0 - act_tau_b)
-        a_prime = a_tau + b1_act * (act_step_b / 2.0)
-
-        f2_obs, f2_act = denoiser(
-            noisy_act=a_prime.squeeze(-2),            # (B,T,A)
-            noisy_obs=z_prime,
-            obs_sigma_idx=obs_tau_plus_half_index,
-            obs_step_idx=obs_half_step_index,
-            act_sigma_idx=act_tau_plus_half_index,
-            act_step_idx=act_half_step_index,
-        )
-
-        denom2_obs = 1.0 - (obs_tau_b + obs_step_b / 2.0)
-        b2_obs = (f2_obs - z_prime) / denom2_obs
-        v_target_obs = 0.5 * (b1_obs + b2_obs)
-
-        denom2_act = 1.0 - (act_tau_b + act_step_b / 2.0)
-        b2_act = (f2_act - a_prime) / denom2_act
-        v_target_act = 0.5 * (b1_act + b2_act)
-
-    denoiser.train()
-
-    # =================================================
-    # 2) Big-step prediction (grad tracked)
-    # =================================================
-    z_hat, a_hat = denoiser(
-        noisy_act=a_tau_detached.squeeze(-2).clone().requires_grad_(True),  # (B,T,A)
-        noisy_obs=x_tau_detached.clone().requires_grad_(True),
-        obs_sigma_idx=obs_tau_index,
-        obs_step_idx=obs_step_index,
-        act_sigma_idx=act_tau_index,
-        act_step_idx=act_step_index,
-    )  # a_hat: (B,T,1,A)
-
-    # =================================================
-    # 3) Losses (obs)
-    # =================================================
-    w_obs = ramp_weight(obs_tau)
-
-    obs_flow_sq = (z_hat - x).pow(2).mean(dim=(-1, -2))  # (B,T)
-    obs_mask_small = (obs_step_index == 0).float()
-    obs_flow_loss = (w_obs * obs_flow_sq * obs_mask_small).sum() / obs_mask_small.sum().clamp_min(1.0)
-
-    v_hat_obs = (z_hat - x_tau) / (1.0 - obs_tau_b)
-    obs_boot_sq = ((1.0 - obs_tau_b) ** 2 * (v_hat_obs - v_target_obs).pow(2)).mean(dim=(-1, -2))
-    obs_mask_large = (obs_step_index > 0).float()
-    obs_bootstrap_loss = (w_obs * obs_boot_sq * obs_mask_large).sum() / obs_mask_large.sum().clamp_min(1.0)
-
-    # =================================================
-    # 4) Losses (act)
-    # =================================================
-    w_act = ramp_weight(act_tau)
-
-    act_flow_sq = (a_hat - a).pow(2).mean(dim=(-1, -2))  # (B,T) since (B,T,1,A)
-    act_mask_small = (act_step_index == 0).float()
-    act_flow_loss = (w_act * act_flow_sq * act_mask_small).sum() / act_mask_small.sum().clamp_min(1.0)
-
-    v_hat_act = (a_hat - a_tau) / (1.0 - act_tau_b)
-    act_boot_sq = ((1.0 - act_tau_b) ** 2 * (v_hat_act - v_target_act).pow(2)).mean(dim=(-1, -2))
-    act_mask_large = (act_step_index > 0).float()
-    act_bootstrap_loss = (w_act * act_boot_sq * act_mask_large).sum() / act_mask_large.sum().clamp_min(1.0)
-
-    return obs_flow_loss, obs_bootstrap_loss, act_flow_loss, act_bootstrap_loss
-
-# Flowmatching without shortcut learning
 class FlowMatchingForwardProcess(nn.Module):
     """
     Dyadic shortcut schedule for BOTH:
@@ -365,6 +124,258 @@ def compute_flowmatching_loss(
     obs_flow_loss = (z_hat - obs_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
     act_flow_loss = (a_hat - act_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
     return obs_flow_loss, act_flow_loss
+class JointForwardDiffusionWithShortcut(nn.Module):
+    """
+    Dyadic shortcut schedule for BOTH obs latents and actions.
+
+    Shortcut length (step/d) is shared between modalities so the denoiser always
+    jumps the same distance in time.  Noise levels (τ_obs, τ_act) are sampled
+    independently, enabling the denoiser to be used in single-modality or masked
+    settings at inference time.
+
+    num_noise_levels must be a power of 2, e.g. 32 or 64.
+
+    Index convention:
+      max_pow2 = log2(num_noise_levels)
+      step_index = 0       ↔ d = d_min   (finest)
+      step_index = max_pow2 ↔ d = 1      (coarsest)
+    """
+
+    def __init__(self, num_noise_levels: int = 32, action_noise_std: float = 1.0):
+        super().__init__()
+        assert (num_noise_levels & (num_noise_levels - 1)) == 0, \
+            "num_noise_levels must be a power of 2"
+        self.num_noise_levels = int(num_noise_levels)
+        self.max_pow2 = int(math.log2(self.num_noise_levels))
+        self.d_min = 1.0 / float(self.num_noise_levels)
+        self.action_noise_std = action_noise_std
+
+    def _sample_tau(self, step_index_raw, num_levels, step, step_index, device):
+        """Sample an independent τ on the grid defined by step_index_raw."""
+        B, T = step_index_raw.shape
+        m = torch.floor(
+            torch.rand(B, T, device=device) * 0.9999 * num_levels
+        ).long()
+        tau       = m.float() * step                                        # (B, T)
+        tau_index = m * (2 ** step_index)                                   # (B, T)
+        delta     = (2 ** step_index) // 2
+        tau_plus_half_index = torch.clamp(
+            tau_index + delta, min=0, max=self.num_noise_levels - 1
+        )
+        return tau, tau_index, tau_plus_half_index
+
+    def sample_step_noise(self, batch_size: int, seq_len: int, device):
+        """
+        Returns per-frame diffusion parameters.
+
+        Shared across modalities:
+          step            : (B, T) float   d_t ∈ {1, 1/2, ..., 1/num_noise_levels}
+          step_index      : (B, T) long    0 ↔ d_min, max_pow2 ↔ 1
+          half_step_index : (B, T) long    step_index - 1 (clamped at 0)
+
+        Independent per modality:
+          tau_obs / tau_act               : (B, T) float  τ ∈ {0, d, 2d, ..., 1-d}
+          tau_obs_index / tau_act_index   : (B, T) long   τ index on finest grid
+          tau_obs_plus_half / tau_act_plus_half : (B, T) long  index for τ + d/2
+        """
+        B, T = batch_size, seq_len
+
+        # --- shared step ---
+        step_index_raw = torch.randint(
+            low=0, high=self.max_pow2 + 1, size=(B, T), device=device, dtype=torch.long
+        )
+        step       = 1.0 / (2.0 ** step_index_raw.float())    # (B, T)
+        step_index = self.max_pow2 - step_index_raw            # (B, T), 0 ↔ d_min
+        num_levels = (2 ** step_index_raw).float()             # (B, T)
+        half_step_index = torch.clamp(step_index - 1, min=0)  # (B, T)
+
+        # --- independent τ for each modality ---
+        tau_obs, tau_obs_index, tau_obs_plus_half = self._sample_tau(
+            step_index_raw, num_levels, step, step_index, device
+        )
+        tau_act, tau_act_index, tau_act_plus_half = self._sample_tau(
+            step_index_raw, num_levels, step, step_index, device
+        )
+
+        return dict(
+            # shared
+            step=step,
+            step_index=step_index,
+            half_step_index=half_step_index,
+            # obs-specific
+            tau_obs=tau_obs,
+            tau_obs_index=tau_obs_index,
+            tau_obs_plus_half=tau_obs_plus_half,
+            # act-specific
+            tau_act=tau_act,
+            tau_act_index=tau_act_index,
+            tau_act_plus_half=tau_act_plus_half,
+        )
+
+    def forward(
+        self,
+        z_clean: torch.Tensor,  # (B, T, N_lat, D_lat)
+        a_clean: torch.Tensor,  # (B, T, N_act_tokens, n_actions)
+    ):
+        B, T, N_lat, D_lat = z_clean.shape
+        device = z_clean.device
+
+        diff = self.sample_step_noise(B, T, device)
+
+        tau_obs_b = diff["tau_obs"].unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+        tau_act_b = diff["tau_act"].unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+
+        # obs forward diffusion: z_τ = (1 - τ_obs) z_0 + τ_obs z_1
+        z0    = torch.randn_like(z_clean)
+        z_tau = (1.0 - tau_obs_b) * z0 + tau_obs_b * z_clean
+
+        # action forward diffusion: a_τ = (1 - τ_act) a_0 + τ_act a_1
+        a0    = self.action_noise_std * torch.randn_like(a_clean)
+        a_tau = (1.0 - tau_act_b) * a0 + tau_act_b * a_clean
+
+        return {
+            # clean / noisy obs
+            "x":     z_clean,
+            "x0":    z0,
+            "x_tau": z_tau,
+            # clean / noisy action
+            "a":     a_clean,
+            "a0":    a0,
+            "a_tau": a_tau,
+            # shared step schedule
+            "step":             diff["step"],
+            "step_index":       diff["step_index"],
+            "half_step_index":  diff["half_step_index"],
+            # obs noise schedule
+            "tau_obs":              diff["tau_obs"],
+            "tau_obs_index":        diff["tau_obs_index"],
+            "tau_obs_plus_half":    diff["tau_obs_plus_half"],
+            # act noise schedule
+            "tau_act":              diff["tau_act"],
+            "tau_act_index":        diff["tau_act_index"],
+            "tau_act_plus_half":    diff["tau_act_plus_half"],
+            "d_min":            self.d_min,
+            "num_noise_levels": self.num_noise_levels,
+        }
+
+
+def compute_joint_bootstrap_diffusion_loss(
+    info: dict,
+    denoiser: DreamerV4Denoiser,
+):
+    """
+    Bootstrap shortcut loss for JOINT obs + action denoising.
+
+    Shortcut length (step/d) is shared; noise levels (τ_obs, τ_act) are independent.
+
+    Returns
+    -------
+    obs_flow_loss, act_flow_loss, obs_bootstrap_loss, act_bootstrap_loss
+      Each is a scalar tensor.
+    """
+    x     = info["x"]        # (B, T, N_lat, D_lat)
+    x_tau = info["x_tau"]    # (B, T, N_lat, D_lat)
+    a     = info["a"]        # (B, T, 1, n_actions)
+    a_tau = info["a_tau"]    # (B, T, 1, n_actions)
+
+    step             = info["step"]               # (B, T)
+    step_index       = info["step_index"]         # (B, T) long
+    half_step_index  = info["half_step_index"]    # (B, T) long
+    tau_obs          = info["tau_obs"]            # (B, T)
+    tau_obs_index    = info["tau_obs_index"]      # (B, T) long
+    tau_obs_plus_half= info["tau_obs_plus_half"]  # (B, T) long
+    tau_act          = info["tau_act"]            # (B, T)
+    tau_act_index    = info["tau_act_index"]      # (B, T) long
+    tau_act_plus_half= info["tau_act_plus_half"]  # (B, T) long
+
+    B, T, N_lat, D_lat = x.shape
+    tau_obs_b = tau_obs.view(B, T, 1, 1)
+    tau_act_b = tau_act.view(B, T, 1, 1)
+    step_b    = step.view(B, T, 1, 1)
+
+    x_tau_det = x_tau.detach()
+    a_tau_det = a_tau.detach()
+
+    # ---------------------------------------------------------------
+    # 1) Bootstrap target via two half-steps  (no gradient)
+    # ---------------------------------------------------------------
+    with torch.no_grad():
+        denoiser.eval()
+
+        # --- first half-step ---
+        f_obs1, f_act1 = denoiser(
+            noisy_act=a_tau_det.squeeze(-2),
+            noisy_obs=x_tau_det,
+            obs_sigma_idx=tau_obs_index,
+            obs_step_idx=half_step_index,
+            act_sigma_idx=tau_act_index,
+            act_step_idx=half_step_index,
+        )
+        b_obs1 = (f_obs1 - x_tau) / (1.0 - tau_obs_b)
+        b_act1 = (f_act1 - a_tau) / (1.0 - tau_act_b)
+
+        z_prime = x_tau + b_obs1 * (step_b / 2.0)
+        a_prime = a_tau + b_act1 * (step_b / 2.0)
+
+        # --- second half-step ---
+        f_obs2, f_act2 = denoiser(
+            noisy_act=a_prime.squeeze(-2),
+            noisy_obs=z_prime,
+            obs_sigma_idx=tau_obs_plus_half,
+            obs_step_idx=half_step_index,
+            act_sigma_idx=tau_act_plus_half,
+            act_step_idx=half_step_index,
+        )
+        b_obs2 = (f_obs2 - z_prime) / (1.0 - (tau_obs_b + step_b / 2.0))
+        b_act2 = (f_act2 - a_prime) / (1.0 - (tau_act_b + step_b / 2.0))
+
+        v_obs_target = 0.5 * (b_obs1 + b_obs2)   # (B, T, N_lat, D_lat)
+        v_act_target = 0.5 * (b_act1 + b_act2)   # (B, T, 1, n_actions)
+
+    denoiser.train()
+
+    # ---------------------------------------------------------------
+    # 2) Full-step prediction  (gradient tracked through denoiser)
+    # ---------------------------------------------------------------
+    z_hat, a_hat = denoiser(
+        noisy_act=a_tau_det.clone().requires_grad_(True).squeeze(-2),
+        noisy_obs=x_tau_det.clone().requires_grad_(True),
+        obs_sigma_idx=tau_obs_index,
+        obs_step_idx=step_index,
+        act_sigma_idx=tau_act_index,
+        act_step_idx=step_index,
+    )  # z_hat: (B,T,N_lat,D_lat)  a_hat: (B,T,1,n_actions)
+
+    # ---------------------------------------------------------------
+    # 3) Losses
+    # ---------------------------------------------------------------
+    w_obs      = ramp_weight(tau_obs)           # (B, T)
+    w_act      = ramp_weight(tau_act)           # (B, T)
+    mask_small = (step_index == 0).float()      # finest-step frames
+    mask_large = (step_index > 0).float()       # coarser-step frames
+
+    # --- flow losses (finest step only, direct x-prediction) ---
+    obs_flow_sq = (z_hat - x).pow(2).mean(dim=(-1, -2))     # (B, T)
+    act_flow_sq = (a_hat - a).pow(2).mean(dim=(-1, -2))     # (B, T)
+
+    denom_flow = mask_small.sum().clamp_min(1.0)
+    obs_flow_loss = (w_obs * obs_flow_sq * mask_small).sum() / denom_flow
+    act_flow_loss = (w_act * act_flow_sq * mask_small).sum() / denom_flow
+
+    # --- bootstrap losses (coarser steps only) ---
+    v_obs_hat = (z_hat - x_tau) / (1.0 - tau_obs_b)
+    v_act_hat = (a_hat - a_tau) / (1.0 - tau_act_b)
+
+    obs_boot_sq = ((1.0 - tau_obs_b) ** 2 * (v_obs_hat - v_obs_target).pow(2)).mean(dim=(-1, -2))
+    act_boot_sq = ((1.0 - tau_act_b) ** 2 * (v_act_hat - v_act_target).pow(2)).mean(dim=(-1, -2))
+
+    denom_boot = mask_large.sum().clamp_min(1.0)
+    obs_bootstrap_loss = (w_obs * obs_boot_sq * mask_large).sum() / denom_boot
+    act_bootstrap_loss = (w_act * act_boot_sq * mask_large).sum() / denom_boot
+
+    return obs_flow_loss, act_flow_loss, obs_bootstrap_loss, act_bootstrap_loss
+
+
 class RMSLossScaler:
     """
     Tracks running RMS for named losses and returns normalized losses.

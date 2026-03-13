@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from dreamerv4.datasets import create_distributed_dataloader
-from dreamerv4.loss import FlowMatchingForwardProcess, compute_flowmatching_loss
+from dreamerv4.loss import JointForwardDiffusionWithShortcut, compute_joint_bootstrap_diffusion_loss
 from dreamerv4.models.dynamics import DenoiserWrapper
 from dreamerv4.models.utils import load_denoiser, load_tokenizer
 from dreamerv4.utils.distributed import (
@@ -83,9 +83,8 @@ def build_models(cfg, device, local_rank):
     else:
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
 
-    diffuser = FlowMatchingForwardProcess(
-        max_diff_steps=cfg.denoiser.num_noise_levels,
-        device=device,
+    diffuser = JointForwardDiffusionWithShortcut(
+        num_noise_levels=cfg.denoiser.num_noise_levels,
     )
 
     tokenizer = tokenizer.to(device)
@@ -173,6 +172,8 @@ def train_epoch(
 
     accum_obs_flow = 0.0
     accum_act_flow = 0.0
+    accum_obs_boot = 0.0
+    accum_act_boot = 0.0
     accum_total = 0.0
 
     data_start = time.perf_counter()
@@ -208,26 +209,20 @@ def train_epoch(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 z_clean = tokenizer.encode(images).detach().clone()
 
-        T = z_clean.shape[1]
-        context_length = (
-            torch.randint(1, max(2, T // 2), (1,)).item()
-            if torch.rand(1).item() < CONTEXT_PROB
-            else None
-        )
-
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            diffused_info = diffuser(z_clean, actions, context_length=context_length)
-            obs_flow_loss, act_flow_loss = compute_flowmatching_loss(
-                diffused_info, denoiser, device=device
-            )
+            diffused_info = diffuser(z_clean, actions)
+            obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss = \
+                compute_joint_bootstrap_diffusion_loss(diffused_info, denoiser)
             loss_micro = (
-                obs_flow_loss.mean() + act_flow_loss.mean()
+                obs_flow_loss + act_flow_loss + obs_boot_loss + act_boot_loss
             ) / cfg.train.accum_grad_steps
 
         loss_micro.backward()
 
-        accum_obs_flow += obs_flow_loss.mean().item()
-        accum_act_flow += act_flow_loss.mean().item()
+        accum_obs_flow += obs_flow_loss.item()
+        accum_act_flow += act_flow_loss.item()
+        accum_obs_boot += obs_boot_loss.item()
+        accum_act_boot += act_boot_loss.item()
         accum_total += loss_micro.item()
 
         # --- Optimizer step at end of accumulation window ---
@@ -248,14 +243,18 @@ def train_epoch(
                 tb_writer.add_scalar("train/total_loss", sync_loss, global_update)
                 tb_writer.add_scalar("train/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar("train/act_flow_loss", accum_act_flow, global_update)
+                tb_writer.add_scalar("train/obs_boot_loss", accum_obs_boot, global_update)
+                tb_writer.add_scalar("train/act_boot_loss", accum_act_boot, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
 
                 if global_update % cfg.print_every == 0:
                     print(
                         f"  [step {global_update}]"
                         f"  loss: {sync_loss:.4f}"
-                        f"  obs: {accum_obs_flow:.4f}"
-                        f"  act: {accum_act_flow:.4f}"
+                        f"  obs_flow: {accum_obs_flow:.4f}"
+                        f"  act_flow: {accum_act_flow:.4f}"
+                        f"  obs_boot: {accum_obs_boot:.4f}"
+                        f"  act_boot: {accum_act_boot:.4f}"
                         f"  lr: {lr:.2e}"
                     )
 
@@ -275,6 +274,8 @@ def train_epoch(
 
             accum_obs_flow = 0.0
             accum_act_flow = 0.0
+            accum_obs_boot = 0.0
+            accum_act_boot = 0.0
             accum_total = 0.0
 
         torch.cuda.synchronize(device)
