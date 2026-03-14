@@ -121,9 +121,15 @@ def compute_flowmatching_loss(
     obs_x_target = x                    # (B, T, N_lat, D_lat)
     act_x_target = a                    # (B, T, 1, n_actions)
 
-    obs_flow_loss = (z_hat - obs_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
-    act_flow_loss = (a_hat - act_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    obs_flow_sq = (z_hat - obs_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    act_flow_sq = (a_hat - act_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    w_obs      = ramp_weight(info['obs_tau'].squeeze())           # (B, T)
+    w_act      = ramp_weight(info['act_tau'].squeeze())           # (B, T)
+    obs_flow_loss = (obs_flow_sq*w_obs).mean()
+    act_flow_loss = (act_flow_sq*w_act).mean()
+
     return obs_flow_loss, act_flow_loss
+
 class JointForwardDiffusionWithShortcut(nn.Module):
     """
     Dyadic shortcut schedule for BOTH obs latents and actions.
@@ -258,7 +264,6 @@ class JointForwardDiffusionWithShortcut(nn.Module):
             "num_noise_levels": self.num_noise_levels,
         }
 
-
 def compute_joint_bootstrap_diffusion_loss(
     info: dict,
     denoiser: DreamerV4Denoiser,
@@ -374,7 +379,6 @@ def compute_joint_bootstrap_diffusion_loss(
     act_bootstrap_loss = (w_act * act_boot_sq * mask_large).sum() / denom_boot
 
     return obs_flow_loss, act_flow_loss, obs_bootstrap_loss, act_bootstrap_loss
-
 
 class RMSLossScaler:
     """

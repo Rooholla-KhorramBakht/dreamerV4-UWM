@@ -221,7 +221,7 @@ def train_epoch(
                 diffused_info, denoiser, device=device
             )
             loss_micro = (
-                obs_flow_loss.mean() + act_flow_loss.mean()
+                obs_flow_loss + act_flow_loss
             ) / cfg.train.accum_grad_steps
 
         loss_micro.backward()
