@@ -181,14 +181,7 @@ def train_epoch(
 
         # --- Prepare batch ---
         images = batch["image"].to(device, non_blocking=True)  # (B, T, C, H, W)
-        if not cfg.train.video_pretraining:
-            actions = batch["action"].to(device, non_blocking=True)  # (B, T, action_dim)
-        else:
-            actions = torch.zeros(
-                images.shape[0], images.shape[1], cfg.denoiser.n_actions,
-                device=images.device, dtype=images.dtype,
-            )
-
+        actions = batch["action"].to(device, non_blocking=True)  # (B, T, action_dim)
         images = images.to(torch.bfloat16)
         # Slice to configured action dims and add token dimension: (B, T, A) -> (B, T, 1, A)
         actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions].unsqueeze(-2)
