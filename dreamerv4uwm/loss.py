@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from .models.dynamics import DreamerV4Denoiser
 import torch.distributed as dist
+import random
 
 
 def ramp_weight(tau: torch.Tensor) -> torch.Tensor:
@@ -130,6 +131,175 @@ def compute_flowmatching_loss(
 
     return obs_flow_loss, act_flow_loss
 
+class UWMForwardProcess(nn.Module):
+    """
+    Dyadic shortcut schedule for BOTH:
+      - obs latents z: (B, T, N_lat, D_lat)
+      - actions a:     (B, T, 1, n_actions)   (we enforce num_action_tokens=1)
+
+    Forward mixing:
+      x_tau = (1 - tau) * x0 + tau * x_clean
+    """
+
+    def __init__(self, 
+                 max_diff_steps=32,
+                 action_noise_std: float = 1.,
+                 device='cpu'):
+        super().__init__()
+        self.max_diff_steps = max_diff_steps
+        self.device = device
+        self.action_noise_std = action_noise_std
+        self.modes = ['policy', 'video', 'wm', 'id', 'forcing']
+    def sample_step_noise(self, batch_size, seq_len):
+        B, T = batch_size, seq_len
+        # Diffusion forcing noise level
+        state_tau_d = torch.randint(0, self.max_diff_steps, (B,T)).to(self.device)
+        state_tau = state_tau_d/self.max_diff_steps
+
+        action_tau_d = torch.randint(0, self.max_diff_steps, (B,T)).to(self.device)
+        action_tau = action_tau_d/self.max_diff_steps
+        
+        context_length=torch.randint(1, T, (1,)).item() # Choose a random context length
+        mode = random.choice(self.modes)
+        if mode == 'policy':
+            # context: clean state, clean action ; chunk: noisy state, noisy action
+            state_tau[:, :context_length] =  0.9999                               
+            action_tau[:, :context_length] =  0.9999                                
+            state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)    
+            action_tau[:, context_length:] = action_tau[:, context_length].unsqueeze(-1) 
+        elif mode =='video':
+            # context: clean state, noisy action ; chunk: noisy state, noisy action
+            state_tau[:, :context_length] =  0.9999                               
+            action_tau[:, :context_length] = 0.                                
+            state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)    
+            action_tau[:, context_length:] = 0. 
+        elif mode=='wm':
+            # context: clean state, clean action ; chunk: noisy state, clean action
+            state_tau[:, :context_length] =  0.9999                               
+            action_tau[:, :context_length] = 0.9999                                
+            state_tau[:, context_length:] = state_tau[:, context_length].unsqueeze(-1)    
+            action_tau[:, context_length:] = 0.9999 
+        elif mode=='id':
+            # context: clean state, noisy action ; chunk: clean state, noisy action
+            state_tau[:, :context_length] =  0.9999                               
+            action_tau[:, :context_length] = action_tau[:, context_length].unsqueeze(-1)
+            state_tau[:, context_length:] =  0.9999   
+            action_tau[:, context_length:] = action_tau[:, context_length].unsqueeze(-1)
+        elif mode=='forcing':
+            # Chunked diffusion forcing mode
+            # context: state and action with noise level 1 ; state and action with noise level 2
+            state_tau[:, :context_length] =  state_tau[:, 0].unsqueeze(-1)                          
+            action_tau[:, :context_length] = action_tau[:, 0].unsqueeze(-1)
+            state_tau[:, context_length:] =  state_tau[:, context_length].unsqueeze(-1)   
+            action_tau[:, context_length:] = action_tau[:, context_length].unsqueeze(-1)
+        else:
+            raise NotImplementedError
+
+        state_tau_idx = (state_tau*self.max_diff_steps).to(torch.long)
+        action_tau_idx = (action_tau*self.max_diff_steps).to(torch.long)
+        obs_diff = dict(tau=state_tau, tau_idx = state_tau_idx.to(self.device))
+        act_diff = dict(tau=action_tau, tau_idx = action_tau_idx.to(self.device))
+        return obs_diff, act_diff, context_length, mode
+
+    def forward(
+        self,
+        z_clean: torch.Tensor,     # (B, T, N_lat, D_lat)
+        a_clean: torch.Tensor,     # (B, T, N_act_tokens, n_actions)   (raw actions from dataset)
+    ):
+        B, T, N_lat, D_lat = z_clean.shape
+        device = z_clean.device
+        obs_diff, act_diff, context_length, mode = self.sample_step_noise(B, T)
+        
+        # observation forward diffusion
+        z0 = torch.randn_like(z_clean)
+        obs_tau = obs_diff["tau"].unsqueeze(-1).unsqueeze(-1)  # (B,T,1,1)
+        z_tau = (1. - obs_tau) * z0 + obs_tau * z_clean
+
+        # action forward diffusion
+        a0 = self.action_noise_std * torch.randn_like(a_clean)
+        act_tau = act_diff["tau"].unsqueeze(-1).unsqueeze(-1)  # (B,T,1,1)
+        a_tau = (1. - act_tau) * a0 + act_tau * a_clean
+
+        return {
+            # obs
+            "x": z_clean,
+            "x0": z0,
+            "x_tau": z_tau,
+            "obs_tau": obs_diff["tau"],
+            "obs_tau_idx": obs_diff["tau_idx"],
+            # act
+            "a": a_clean,
+            "a0": a0,
+            "a_tau": a_tau,
+            "act_tau": act_diff["tau"],
+            "act_tau_idx": act_diff["tau_idx"],
+            "context_length": context_length,
+            "mode": mode
+        }
+    
+def compute_uwm_loss(
+    info: dict,
+    denoiser: DreamerV4Denoiser,
+    device='cpu', 
+):
+    
+    # --- obs ---
+    x = info["x"]
+    B, T, N_lat, D_lat = x.shape
+    x_tau = info["x_tau"]
+    obs_tau_idx = info["obs_tau_idx"]
+
+    # --- act (S_a = 1) ---
+    a = info["a"]         # (B,T,1,n_actions)
+    a_tau = info["a_tau"] # (B,T,1,n_actions)
+    act_tau_idx = info["act_tau_idx"]  # (B, T)
+
+    step_idx = torch.zeros((B, T), dtype=torch.long, device=device)
+
+    z_hat, a_hat = denoiser(
+        noisy_act=a_tau.squeeze(-2),  # (B,T,A) — denoiser expects (B,T,n_actions)
+        noisy_obs=x_tau,
+        obs_sigma_idx=obs_tau_idx,
+        obs_step_idx=step_idx,
+        act_sigma_idx=act_tau_idx,
+        act_step_idx=step_idx,
+    )  # a_hat: (B,T,1,A)
+
+    # X-prediction targets: directly regress clean signal
+    obs_x_target = x                    # (B, T, N_lat, D_lat)
+    act_x_target = a                    # (B, T, 1, n_actions)
+
+    obs_flow_sq = (z_hat - obs_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    act_flow_sq = (a_hat - act_x_target).pow(2).mean(dim=(-1, -2))  # (B, T)
+    w_obs      = ramp_weight(info['obs_tau'].squeeze())           # (B, T)
+    w_act      = ramp_weight(info['act_tau'].squeeze())           # (B, T)
+
+    mode = info['mode']
+    context_length = info['context_length']
+    if mode=='policy':
+        obs_flow_loss = (obs_flow_sq*w_obs)[:, context_length:].mean()
+        act_flow_loss = (act_flow_sq*w_act)[:, context_length:].mean()
+    elif mode=='video':
+        obs_flow_loss = (obs_flow_sq*w_obs)[:, context_length:].mean()
+        act_flow_loss = (act_flow_sq*w_act).mean()*0.
+
+    elif mode=='wm':
+        obs_flow_loss = (obs_flow_sq*w_obs)[:, context_length:].mean()
+        act_flow_loss = (act_flow_sq*w_act).mean()*0.
+
+    elif mode=='id':
+        obs_flow_loss = (obs_flow_sq*w_obs).mean()*0.
+        act_flow_loss = (act_flow_sq*w_act).mean()
+
+    elif mode=='forcing':
+        obs_flow_loss = (obs_flow_sq*w_obs).mean()
+        act_flow_loss = (act_flow_sq*w_act).mean()
+    else:
+        raise NotImplementedError
+        
+    return obs_flow_loss, act_flow_loss
+
+## To Finish later --->
 class JointForwardDiffusionWithShortcut(nn.Module):
     """
     Dyadic shortcut schedule for BOTH obs latents and actions.

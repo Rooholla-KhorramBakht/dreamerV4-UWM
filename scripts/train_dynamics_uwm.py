@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from dreamerv4uwm.datasets import create_distributed_dataloader
-from dreamerv4uwm.loss import FlowMatchingForwardProcess, compute_flowmatching_loss
+from dreamerv4uwm.loss import UWMForwardProcess, compute_uwm_loss
 from dreamerv4uwm.models.dynamics import DenoiserWrapper
 from dreamerv4uwm.models.utils import load_denoiser, load_tokenizer
 from dreamerv4uwm.utils.distributed import (
@@ -23,10 +23,6 @@ from dreamerv4uwm.utils.distributed import (
     setup_distributed,
 )
 
-
-# Probability of using a random context length instead of full sequence.
-# When triggered, context length is sampled uniformly from [1, T//2].
-CONTEXT_PROB = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +79,7 @@ def build_models(cfg, device, local_rank):
     else:
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
 
-    diffuser = FlowMatchingForwardProcess(
+    diffuser = UWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         device=device,
     )
@@ -208,16 +204,9 @@ def train_epoch(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 z_clean = tokenizer.encode(images).detach().clone()
 
-        T = z_clean.shape[1]
-        context_length = (
-            torch.randint(1, max(2, T // 2), (1,)).item()
-            if torch.rand(1).item() < CONTEXT_PROB
-            else None
-        )
-
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            diffused_info = diffuser(z_clean, actions, context_length=context_length)
-            obs_flow_loss, act_flow_loss = compute_flowmatching_loss(
+            diffused_info = diffuser(z_clean, actions)
+            obs_flow_loss, act_flow_loss = compute_uwm_loss(
                 diffused_info, denoiser, device=device
             )
             loss_micro = (

@@ -85,6 +85,166 @@ def forward_dynamics_no_cache(
     # z_hat is the output of the last denoiser step which is the predicted clean latents
     return z_hat[:, num_context_frames:] 
 
+@torch.no_grad()
+def forward_dynamics_flowmatching_no_cache(
+    denoiser,
+    ctx_latents,              # (B, T_ctx, N_lat, D_lat)
+    ctx_actions,              # (B, T_ctx, n_act)
+    num_pred_steps=1,
+    num_diffusion_steps=4,    # power of two
+    context_cond_tau=0.9,
+):
+    """
+    Euler sampler for the plain flowmatching denoiser (no shortcut).
+
+    step_idx is always 0 (finest step = d_min), matching compute_flowmatching_loss.
+    Both obs latents and actions are jointly denoised.
+
+    Returns
+    -------
+    pred_obs  : (B, num_pred_steps, N_lat, D_lat)
+    pred_act  : (B, num_pred_steps, n_act)
+    """
+    device = ctx_latents.device
+    dtype  = ctx_latents.dtype
+
+    B, T_ctx, N_lat, D_lat = ctx_latents.shape
+    n_act   = ctx_actions.shape[-1]
+    T_total = T_ctx + num_pred_steps
+
+    assert (num_diffusion_steps & (num_diffusion_steps - 1)) == 0, \
+        "num_diffusion_steps must be a power of two"
+
+    num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+
+    # flowmatching uses only the finest step (step_idx == 0 == d_min)
+    step_index_tensor = torch.zeros((B, T_total), dtype=torch.long, device=device)
+
+    # 1) Initialize pure noise for the full sequence
+    z     = torch.randn(B, T_total, N_lat, D_lat, device=device, dtype=dtype)
+    z_act = torch.randn(B, T_total, n_act,         device=device, dtype=dtype)
+
+    # 2) Replace context frames with slightly noised clean tokens
+    z_ctx = (1.0 - context_cond_tau) * torch.randn_like(ctx_latents) + context_cond_tau * ctx_latents
+    a_ctx = (1.0 - context_cond_tau) * torch.randn_like(ctx_actions) + context_cond_tau * ctx_actions
+    z    [:, :T_ctx] = z_ctx
+    z_act[:, :T_ctx] = a_ctx
+
+    # discrete tau index for context frames
+    tau_cond_idx = get_noise_index(context_cond_tau, num_noise_levels)
+
+    # stride is exact because both num_noise_levels and num_diffusion_steps are powers of 2
+    stride    = num_noise_levels // num_diffusion_steps
+    step_size = 1.0 / num_diffusion_steps
+
+    for k in range(num_diffusion_steps):
+        tau_current_idx = k * stride
+        tau_current     = tau_current_idx / float(num_noise_levels)
+
+        tau_index_tensor = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+        tau_index_tensor[:, :T_ctx] = tau_cond_idx   # context frames stay at tau_c
+
+        z_hat, act_hat = denoiser(
+            noisy_act    = z_act,
+            noisy_obs    = z,
+            obs_sigma_idx= tau_index_tensor,
+            obs_step_idx = step_index_tensor,
+            act_sigma_idx= tau_index_tensor,
+            act_step_idx = step_index_tensor,
+        )
+        act_hat = act_hat.squeeze(-2)   # (B, T, n_act)
+
+        denom = max(1.0 - tau_current, 1e-5)
+        v_obs = (z_hat  - z    ) / denom
+        v_act = (act_hat - z_act) / denom
+
+        # integrate only future frames
+        z    [:, T_ctx:] = z    [:, T_ctx:] + (v_obs * step_size)[:, T_ctx:]
+        z_act[:, T_ctx:] = z_act[:, T_ctx:] + (v_act * step_size)[:, T_ctx:]
+
+    return z[:, T_ctx:], z_act[:, T_ctx:]
+
+
+@torch.no_grad()
+def worldmodel_dynamics_flowmatching_no_cache(
+    denoiser,
+    ctx_latents,              # (B, T_ctx, N_lat, D_lat)  — context obs frames
+    all_actions,              # (B, T_ctx + num_pred_steps, n_act) — ALL actions, clean
+    num_pred_steps=1,
+    num_diffusion_steps=4,    # power of two
+    context_cond_tau=0.9,
+):
+    """
+    World-model Euler sampler for the plain flowmatching denoiser (no shortcut).
+
+    Actions are treated as clean conditions for all frames (context + future).
+    Only obs latents are denoised: context frames are conditioned with slight noise,
+    future frames start as pure noise and are integrated toward the clean signal.
+
+    Returns
+    -------
+    pred_obs : (B, num_pred_steps, N_lat, D_lat)
+    """
+    device = ctx_latents.device
+    dtype  = ctx_latents.dtype
+
+    B, T_ctx, N_lat, D_lat = ctx_latents.shape
+    T_total = T_ctx + num_pred_steps
+
+    assert all_actions.shape == (B, T_total, all_actions.shape[-1]), \
+        "all_actions must be (B, T_ctx + num_pred_steps, n_act)"
+    assert (num_diffusion_steps & (num_diffusion_steps - 1)) == 0, \
+        "num_diffusion_steps must be a power of two"
+
+    num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+
+    # flowmatching uses only the finest step for both modalities
+    step_index_tensor = torch.zeros((B, T_total), dtype=torch.long, device=device)
+
+    # actions are fully clean — highest tau index (training convention: tau = (N-1)/N)
+    act_clean_idx = num_noise_levels - 1
+    act_sigma_idx = torch.full((B, T_total), act_clean_idx, dtype=torch.long, device=device)
+
+    # 1) Initialize obs: context = slightly noised clean, future = pure noise
+    z = torch.randn(B, T_total, N_lat, D_lat, device=device, dtype=dtype)
+    z_ctx = (1.0 - context_cond_tau) * torch.randn_like(ctx_latents) + context_cond_tau * ctx_latents
+    z[:, :T_ctx] = z_ctx
+
+    # discrete tau index for context obs frames
+    tau_cond_idx = get_noise_index(context_cond_tau, num_noise_levels)
+
+    # stride is exact because both num_noise_levels and num_diffusion_steps are powers of 2
+    stride    = num_noise_levels // num_diffusion_steps
+    step_size = 1.0 / num_diffusion_steps
+
+    # clean actions passed as-is for all frames (no integration needed)
+    clean_act = all_actions.to(device=device, dtype=dtype)
+
+    for k in range(num_diffusion_steps):
+        tau_current_idx = k * stride
+        tau_current     = tau_current_idx / float(num_noise_levels)
+
+        obs_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+        obs_sigma_idx[:, :T_ctx] = tau_cond_idx   # context obs stays at tau_c
+
+        z_hat, _ = denoiser(
+            noisy_act    = clean_act,
+            noisy_obs    = z,
+            obs_sigma_idx= obs_sigma_idx,
+            obs_step_idx = step_index_tensor,
+            act_sigma_idx= act_sigma_idx,
+            act_step_idx = step_index_tensor,
+        )
+
+        denom = max(1.0 - tau_current, 1e-5)
+        v_obs = (z_hat - z) / denom
+
+        # integrate only future obs frames; context and actions are fixed
+        z[:, T_ctx:] = z[:, T_ctx:] + (v_obs * step_size)[:, T_ctx:]
+
+    return z[:, T_ctx:]
+
+
 import time
 class AutoRegressiveForwardDynamics:
     def __init__(self, 

@@ -103,7 +103,7 @@ def build_models(cfg, device, local_rank):
     return tokenizer, denoiser, diffuser
 
 
-def setup_logging(cfg, rank, world_size, log_dir, wandb_run_id):
+def setup_logging(cfg, rank, log_dir, wandb_run_id):
     """Initialize TensorBoard and (optionally) W&B on rank 0. Returns (tb_writer, wandb_run_id)."""
     if rank != 0:
         return None, None
@@ -130,7 +130,7 @@ def setup_logging(cfg, rank, world_size, log_dir, wandb_run_id):
         else:
             wandb.init(
                 project=cfg.wandb.project,
-                name=f"run_num_gpus{world_size}",
+                name=cfg.wandb.run_name,
                 config=OmegaConf.to_container(cfg, resolve=True),
                 sync_tensorboard=True,
                 dir=log_dir,
@@ -363,7 +363,7 @@ def main(cfg: DictConfig):
         print("Starting from scratch.")
 
     # --- Logging (rank 0 only, then broadcast) ---
-    tb_writer, wandb_run_id_new = setup_logging(cfg, rank, world_size, log_dir, wandb_run_id)
+    tb_writer, wandb_run_id_new = setup_logging(cfg, rank, log_dir, wandb_run_id)
     if rank == 0:
         log_dir = cfg.output_dir if log_dir is None else log_dir
         wandb_run_id = wandb_run_id_new

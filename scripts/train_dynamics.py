@@ -176,7 +176,7 @@ def main(cfg: DictConfig):
             # Starting a new run
             wandb.init(
                 project=cfg.wandb.project,
-                name=f"run_num_gpus{world_size}",
+                name=cfg.wandb.run_name,
                 config=OmegaConf.to_container(cfg, resolve=True),
                 sync_tensorboard=True,
                 dir=log_dir,
