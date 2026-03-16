@@ -12,11 +12,11 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
-from dreamerv4.datasets import create_distributed_dataloader
-from dreamerv4.loss import FlowMatchingForwardProcess, compute_flowmatching_loss
-from dreamerv4.models.dynamics import DenoiserWrapper
-from dreamerv4.models.utils import load_denoiser, load_tokenizer
-from dreamerv4.utils.distributed import (
+from dreamerv4uwm.datasets import create_distributed_dataloader
+from dreamerv4uwm.loss import FlowMatchingForwardProcess, compute_flowmatching_loss
+from dreamerv4uwm.models.dynamics import DenoiserWrapper
+from dreamerv4uwm.models.utils import load_denoiser, load_tokenizer
+from dreamerv4uwm.utils.distributed import (
     cleanup_distributed,
     load_ddp_checkpoint,
     save_ddp_checkpoint,

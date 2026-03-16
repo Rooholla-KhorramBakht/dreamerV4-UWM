@@ -153,7 +153,7 @@ dreamer-v4/
 ├── checkpoints/
 │   ├── dynamics_ckpts/        # pretrained dynamics weights
 │   └── tokenizer_ckpts/       # pretrained tokenizer weights
-├── dreamerv4/
+├── dreamerv4uwm/
 │   ├── datasets.py            # dataset loading
 │   ├── loss.py                # training losses
 │   ├── sampling.py            # rollout / sampling utilities

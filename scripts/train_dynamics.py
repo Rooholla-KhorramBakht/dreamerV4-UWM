@@ -4,13 +4,13 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from functools import partial
-from dreamerv4.models.utils import load_tokenizer, load_denoiser
-from dreamerv4.models.dynamics import DenoiserWrapper
-from dreamerv4.datasets import create_distributed_dataloader
-from dreamerv4.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
-from dreamerv4.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss, RMSLossScaler
+from dreamerv4uwm.models.utils import load_tokenizer, load_denoiser
+from dreamerv4uwm.models.dynamics import DenoiserWrapper
+from dreamerv4uwm.datasets import create_distributed_dataloader
+from dreamerv4uwm.utils.distributed import load_ddp_checkpoint, save_ddp_checkpoint
+from dreamerv4uwm.loss import ForwardDiffusionWithShortcut, compute_bootstrap_diffusion_loss, RMSLossScaler
 
-from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
+from dreamerv4uwm.utils.distributed import setup_distributed, cleanup_distributed
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 import datetime

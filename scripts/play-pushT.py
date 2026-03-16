@@ -11,11 +11,11 @@ import torch.nn as nn
 from torch.nn.functional import interpolate
 from omegaconf import DictConfig, OmegaConf
 from hydra import initialize, compose
-from dreamerv4.datasets import PushTDataset
-from dreamerv4.utils.joy import XBoxController
-from dreamerv4.models.utils import load_tokenizer
-from dreamerv4.models.utils import load_denoiser
-from dreamerv4.sampling import AutoRegressiveForwardDynamics
+from dreamerv4uwm.datasets import PushTDataset
+from dreamerv4uwm.utils.joy import XBoxController
+from dreamerv4uwm.models.utils import load_tokenizer
+from dreamerv4uwm.models.utils import load_denoiser
+from dreamerv4uwm.sampling import AutoRegressiveForwardDynamics
 
 # -------------------------------------------------------------------------
 # Configurable paths / constants
@@ -90,7 +90,7 @@ def main(cfg: DictConfig):
            
         img = (img[0].permute(1,2,0)*255).to(torch.uint8).cpu().numpy()
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        cv2.imshow("dreamerv4", img)
+        cv2.imshow("dreamerv4uwm", img)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 

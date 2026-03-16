@@ -1,4 +1,4 @@
-name: dreamerv4
+name: dreamerv4uwm
 channels:
   - defaults
   - conda-forge
@@ -168,7 +168,7 @@ dependencies:
       - cycler==0.12.1
       - daqp==0.7.2
       - dnspython==2.8.0
-      - dreamerv4==0.4.3
+      - dreamerv4uwm==0.4.3
       - etils==1.13.0
       - evdev==1.9.2
       - filelock==3.19.1
@@ -266,4 +266,4 @@ dependencies:
       - zerorpc==0.6.3
       - zope-event==6.1
       - zope-interface==8.1.1
-prefix: /home/mim-server/miniconda3/envs/dreamerv4
+prefix: /home/mim-server/miniconda3/envs/dreamerv4uwm

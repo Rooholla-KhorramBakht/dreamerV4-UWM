@@ -21,12 +21,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
-from dreamerv4.models.tokenizer import TokenizerWrapper 
-from dreamerv4.models.blocks import EfficientTransformerLayer
-from dreamerv4.models.utils import load_tokenizer
+from dreamerv4uwm.models.tokenizer import TokenizerWrapper 
+from dreamerv4uwm.models.blocks import EfficientTransformerLayer
+from dreamerv4uwm.models.utils import load_tokenizer
 
-from dreamerv4.datasets import ShardedHDF5Dataset
-from dreamerv4.utils.distributed import setup_distributed, cleanup_distributed
+from dreamerv4uwm.datasets import ShardedHDF5Dataset
+from dreamerv4uwm.utils.distributed import setup_distributed, cleanup_distributed
 import lpips
 from torch.utils.tensorboard import SummaryWriter
 import wandb

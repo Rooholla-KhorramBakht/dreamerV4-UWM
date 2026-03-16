@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dreamerv4"
+name = "dreamerv4uwm"
 version = "0.4.3"
 description = "Machines in Motion (MiM) implementation of the Dreamver V4 world model."
 requires-python = ">=3.10"
