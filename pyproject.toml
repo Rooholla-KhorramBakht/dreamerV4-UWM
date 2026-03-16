@@ -7,7 +7,7 @@ name = "dreamerv4uwm"
 version = "0.4.3"
 description = "Machines in Motion (MiM) implementation of the Dreamver V4 world model."
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "GPL-3.0-only"
 
 authors = [
     { name = "Joseph Amigo", email = "ja5009@nyu.edu" },
@@ -22,3 +22,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+exclude = ["build*", "dist*", "scripts*"]
