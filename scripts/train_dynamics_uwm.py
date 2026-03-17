@@ -119,7 +119,7 @@ def setup_logging(cfg, rank, log_dir, wandb_run_id):
             wandb.init(
                 project=cfg.wandb.project,
                 id=wandb_run_id,
-                resume="must",
+                resume="allow",
                 config=OmegaConf.to_container(cfg, resolve=True),
                 sync_tensorboard=True,
                 dir=log_dir,
