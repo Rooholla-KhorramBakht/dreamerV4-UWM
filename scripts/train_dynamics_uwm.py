@@ -61,6 +61,7 @@ def build_dataloader(cfg, rank, world_size):
         split_seed=cfg.dataset.split_seed,
         shuffle=True,
         drop_last=True,
+        absolute_actions=cfg.train.absolute_actions,
     )
     return loader, sampler
 
