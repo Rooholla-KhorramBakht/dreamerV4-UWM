@@ -141,15 +141,24 @@ class UWMForwardProcess(nn.Module):
       x_tau = (1 - tau) * x0 + tau * x_clean
     """
 
-    def __init__(self, 
+    def __init__(self,
                  max_diff_steps=32,
                  action_noise_std: float = 1.,
+                 mode_weights: Optional[dict] = None,
                  device='cpu'):
         super().__init__()
         self.max_diff_steps = max_diff_steps
         self.device = device
         self.action_noise_std = action_noise_std
         self.modes = ['policy', 'video', 'wm', 'id', 'forcing']
+        if mode_weights is not None:
+            weights = [float(mode_weights.get(m, 0.0)) for m in self.modes]
+        else:
+            weights = [1.0] * len(self.modes)
+        total = sum(weights)
+        assert total > 0, "At least one mode must have a positive weight"
+        self.mode_probs = [w / total for w in weights]
+
     def sample_step_noise(self, batch_size, seq_len):
         B, T = batch_size, seq_len
         # Diffusion forcing noise level
@@ -160,7 +169,7 @@ class UWMForwardProcess(nn.Module):
         action_tau = action_tau_d/self.max_diff_steps
         
         context_length=torch.randint(1, T, (1,)).item() # Choose a random context length
-        mode = random.choice(self.modes)
+        mode = random.choices(self.modes, weights=self.mode_probs, k=1)[0]
         if mode == 'policy':
             # context: clean state, clean action ; chunk: noisy state, noisy action
             state_tau[:, :context_length] =  0.9999                               

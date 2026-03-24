@@ -166,6 +166,184 @@ def forward_dynamics_flowmatching_no_cache(
 
 
 @torch.no_grad()
+def unified_flowmatching_sampler(
+    denoiser,
+    ctx_latents,              # (B, T_ctx, N_lat, D_lat)
+    mode='wm',                # 'policy', 'video', 'wm', 'id', 'forcing'
+    ctx_actions=None,         # (B, T_ctx, n_act) — required for policy, wm, id, forcing
+    all_actions=None,         # (B, T_ctx + num_pred_steps, n_act) — alternative: pass all actions at once
+    all_latents=None,         # (B, T_ctx + num_pred_steps, N_lat, D_lat) — required for 'id' mode
+    num_pred_steps=1,
+    num_diffusion_steps=4,    # power of two
+    context_cond_tau=0.9,
+    action_noise_std=1.0,
+):
+    """
+    Unified Euler sampler for all UWM training modes (no shortcut, no cache).
+
+    Modes match the training loss in UWMForwardProcess / compute_uwm_loss:
+
+      policy  — context: clean obs + clean act; denoise future obs + future act
+      video   — context: clean obs, no actions; denoise future obs only
+      wm      — context: clean obs + clean act; denoise future obs with all actions clean
+      id      — all obs clean; denoise actions across all frames
+      forcing — context obs/act conditioned; denoise future obs + future act
+
+    Returns
+    -------
+    pred_obs : (B, num_pred_steps, N_lat, D_lat) or None
+    pred_act : (B, num_pred_steps, n_act)         or None
+        None is returned for the modality that is not denoised in a given mode.
+    """
+    assert mode in ('policy', 'video', 'wm', 'id', 'forcing'), \
+        f"Unknown mode '{mode}'"
+    assert (num_diffusion_steps & (num_diffusion_steps - 1)) == 0, \
+        "num_diffusion_steps must be a power of two"
+
+    device = ctx_latents.device
+    dtype  = ctx_latents.dtype
+    B, T_ctx, N_lat, D_lat = ctx_latents.shape
+    T_total = T_ctx + num_pred_steps
+
+    num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+    step_index_tensor = torch.zeros((B, T_total), dtype=torch.long, device=device)
+
+    tau_cond_idx = get_noise_index(context_cond_tau, num_noise_levels)
+    stride    = num_noise_levels // num_diffusion_steps
+    step_size = 1.0 / num_diffusion_steps
+
+    # --- resolve actions tensor ---
+    if mode == 'video':
+        # video mode: no action signal at all
+        n_act = ctx_actions.shape[-1] if ctx_actions is not None else (
+            all_actions.shape[-1] if all_actions is not None else 1
+        )
+    elif mode == 'wm':
+        # wm needs actions for ALL frames (context + future)
+        assert all_actions is not None, "wm mode requires all_actions (B, T_total, n_act)"
+        n_act = all_actions.shape[-1]
+    elif mode == 'id':
+        # id needs all obs clean
+        assert all_latents is not None, "id mode requires all_latents (B, T_total, N_lat, D_lat)"
+        if all_actions is not None:
+            n_act = all_actions.shape[-1]
+        elif ctx_actions is not None:
+            n_act = ctx_actions.shape[-1]
+        else:
+            raise ValueError("id mode requires ctx_actions or all_actions to determine n_act")
+    else:
+        # policy, forcing
+        assert ctx_actions is not None, f"{mode} mode requires ctx_actions"
+        n_act = ctx_actions.shape[-1]
+
+    # ====================================================================
+    # Initialize obs latents
+    # ====================================================================
+    denoise_obs = mode != 'id'
+
+    if mode == 'id':
+        # obs are fully clean everywhere
+        assert all_latents.shape == (B, T_total, N_lat, D_lat)
+        z = all_latents.clone().to(device=device, dtype=dtype)
+        # set obs sigma to "clean" for all frames
+        obs_clean_idx = num_noise_levels - 1
+    else:
+        z = torch.randn(B, T_total, N_lat, D_lat, device=device, dtype=dtype)
+        z_ctx = (1.0 - context_cond_tau) * torch.randn_like(ctx_latents) + context_cond_tau * ctx_latents
+        z[:, :T_ctx] = z_ctx
+
+    # ====================================================================
+    # Initialize actions
+    # ====================================================================
+    denoise_act = mode in ('policy', 'id', 'forcing')
+
+    if mode == 'wm':
+        # actions are fully clean for all frames
+        z_act = all_actions.to(device=device, dtype=dtype)
+        act_clean_idx = num_noise_levels - 1
+    elif mode == 'video':
+        # actions are pure noise everywhere (never denoised, never conditioned)
+        z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+    elif mode in ('policy', 'forcing'):
+        # context actions are slightly noised clean; future actions start as noise
+        z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+        a_ctx = (1.0 - context_cond_tau) * action_noise_std * torch.randn_like(ctx_actions) + context_cond_tau * ctx_actions.to(device=device, dtype=dtype)
+        z_act[:, :T_ctx] = a_ctx
+    elif mode == 'id':
+        # actions start as noise everywhere
+        z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+
+    # ====================================================================
+    # Euler integration loop
+    # ====================================================================
+    for k in range(num_diffusion_steps):
+        tau_current_idx = k * stride
+        tau_current     = tau_current_idx / float(num_noise_levels)
+
+        # --- obs sigma indices ---
+        if mode == 'id':
+            obs_sigma_idx = torch.full((B, T_total), obs_clean_idx, dtype=torch.long, device=device)
+        else:
+            obs_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+            obs_sigma_idx[:, :T_ctx] = tau_cond_idx
+
+        # --- act sigma indices ---
+        if mode == 'wm':
+            act_sigma_idx = torch.full((B, T_total), act_clean_idx, dtype=torch.long, device=device)
+        elif mode == 'video':
+            # actions are pure noise (tau=0)
+            act_sigma_idx = torch.zeros((B, T_total), dtype=torch.long, device=device)
+        elif mode == 'id':
+            # denoising actions across all frames at same noise level
+            act_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+        else:
+            # policy, forcing: context actions conditioned, future denoised
+            act_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+            act_sigma_idx[:, :T_ctx] = tau_cond_idx
+
+        z_hat, act_hat = denoiser(
+            noisy_act    = z_act,
+            noisy_obs    = z,
+            obs_sigma_idx= obs_sigma_idx,
+            obs_step_idx = step_index_tensor,
+            act_sigma_idx= act_sigma_idx,
+            act_step_idx = step_index_tensor,
+        )
+        act_hat = act_hat.squeeze(-2)  # (B, T, n_act)
+
+        denom = max(1.0 - tau_current, 1e-5)
+
+        # --- integrate obs ---
+        if denoise_obs:
+            v_obs = (z_hat - z) / denom
+            z[:, T_ctx:] = z[:, T_ctx:] + (v_obs * step_size)[:, T_ctx:]
+
+        # --- integrate act ---
+        if denoise_act:
+            v_act = (act_hat - z_act) / denom
+            if mode == 'id':
+                # denoise actions for ALL frames
+                z_act = z_act + v_act * step_size
+            else:
+                # denoise only future actions
+                z_act[:, T_ctx:] = z_act[:, T_ctx:] + (v_act * step_size)[:, T_ctx:]
+
+    # ====================================================================
+    # Return results
+    # ====================================================================
+    out_obs = z[:, T_ctx:] if denoise_obs else None
+    out_act = z_act[:, T_ctx:] if denoise_act else None
+
+    # For modes that don't denoise a modality but still have meaningful output
+    if mode == 'id':
+        out_obs = None   # obs were given as input, not predicted
+    if mode in ('video', 'wm'):
+        out_act = None   # actions were not predicted
+
+    return out_obs, out_act
+
+
+@torch.no_grad()
 def worldmodel_dynamics_flowmatching_no_cache(
     denoiser,
     ctx_latents,              # (B, T_ctx, N_lat, D_lat)  — context obs frames

@@ -8,7 +8,7 @@ from .blocks import EfficientTransformerBlock, LayerType
 from omegaconf import DictConfig, OmegaConf
 
 import torch
-def build_spatial_attention_mask(n_latent: int, n_register: int, n_image_control: int, n_action_control: int, n_action: int) -> torch.Tensor:
+def build_spatial_attention_mask(n_latent: int, n_register: int, n_image_control: int, n_action_control: int, n_action: int, latent_attends_action: bool = False) -> torch.Tensor:
     """
     Builds the spatial attention mask for one frame of the unified world model.
     
@@ -17,7 +17,7 @@ def build_spatial_attention_mask(n_latent: int, n_register: int, n_image_control
     Mask convention: True = CAN attend, False = CANNOT attend (will be converted to -inf in attention)
     
     Rules:
-        - Z    attends to: Z, Reg, IC         (state group sees state + its own noise level)
+        - Z    attends to: Z, Reg, IC           (+ AC, A when latent_attends_action=True)
         - Reg  attends to: Z, Reg, IC         (scratchpad is part of state group)
         - IC   attends to: IC                 (control token, fixed input)
         - AC   attends to: AC                 (control token, fixed input)
@@ -51,10 +51,13 @@ def build_spatial_attention_mask(n_latent: int, n_register: int, n_image_control
     def allow(r0, r1, c0, c1):
         mask_bool[r0:r1, c0:c1] = True
     # --- State Group (Z, Reg) ---
-    # Z attends to: Z, Reg, IC
+    # Z attends to: Z, Reg, IC (+ optionally AC, A when latent_attends_action=True)
     allow(z_start,   z_end,   z_start,   z_end)    # Z   -> Z
     allow(z_start,   z_end,   reg_start, reg_end)   # Z   -> Reg
     allow(z_start,   z_end,   ic_start,  ic_end)    # Z   -> IC
+    if latent_attends_action:
+        allow(z_start,   z_end,   ac_start,  ac_end)    # Z   -> AC
+        allow(z_start,   z_end,   a_start,   a_end)     # Z   -> A
 
     # Reg attends to everything
     allow(reg_start, reg_end, z_start,   z_end)     # Reg -> Z
@@ -121,6 +124,7 @@ class DreamerV4DenoiserCfg:
     n_actions: int = 0  # number of action components
     dual_stream: bool = False
     is_causal: bool = False  # whether to use causal masking in the transformer (should be False for standard denoising, True for stepwise inference)
+    latent_attends_action: bool = False  # whether latent (Z) tokens can directly attend to action (A, AC) tokens
 
 class DreamerV4Denoiser(nn.Module):
     """
@@ -189,6 +193,7 @@ class DreamerV4Denoiser(nn.Module):
             n_image_control=1,
             n_action_control=1,
             n_action=cfg.num_action_tokens,
+            latent_attends_action=cfg.latent_attends_action,
         )
         self.register_buffer("dynamics_spatial_mask", dynamics_spatial_mask, persistent=False)
 
