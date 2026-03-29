@@ -155,7 +155,7 @@ class DreamerV4Denoiser(nn.Module):
                                     2 # noise level + shortcut tokens (obs + act) that are combined into a single control token each
         self.layer_types = [
                 LayerType.SPATIAL,
-                LayerType.TEMPORAL,
+                LayerType.SPATIAL,
                 LayerType.SPATIAL,
                 LayerType.TEMPORAL,
             ]
@@ -246,7 +246,8 @@ class DreamerV4Denoiser(nn.Module):
 
         # --- Transformer dynamics ---
         for layer in self.layers:
-            x = layer(x, spatial_mask=self.dynamics_spatial_mask)
+            # x = layer(x, spatial_mask=self.dynamics_spatial_mask)
+            x = layer(x, spatial_mask=None) # No spatial masking
 
         # --- Project back to latent dim, return only latent slice ---
         # x: (B, T, N_lat + S_r + 1 + S_a, D_model) -> (B, T, N_lat + ..., D_latent)

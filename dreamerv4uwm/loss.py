@@ -168,7 +168,7 @@ class UWMForwardProcess(nn.Module):
         action_tau_d = torch.randint(0, self.max_diff_steps, (B,T)).to(self.device)
         action_tau = action_tau_d/self.max_diff_steps
         
-        context_length=torch.randint(1, T, (1,)).item() # Choose a random context length
+        context_length=torch.randint(1, T-1, (1,)).item() # Choose a random context length
         mode = random.choices(self.modes, weights=self.mode_probs, k=1)[0]
         if mode == 'policy':
             # context: clean state, clean action ; chunk: noisy state, noisy action

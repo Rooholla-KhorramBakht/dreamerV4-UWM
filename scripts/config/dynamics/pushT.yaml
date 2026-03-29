@@ -28,7 +28,7 @@ denoiser:
   qk_norm: false
   num_noise_levels: 128
   n_actions: 2
-  is_causal: false
+  is_causal: true
   latent_attends_action: false
 
 train:
@@ -48,11 +48,11 @@ train:
   enable_fast_matmul: true
   clip_grad_norm: 1.0
   mode_weights:
-    policy: 1.0
-    video: 1.0
+    policy: 0.0
+    video: 0.0
     wm: 1.0
-    id: 1.0
-    forcing: 1.0
+    id: 0.0
+    forcing: 0.0
   video_pretraining: false # Set the action to zero in doing video pretraining
   absolute_actions: false # Whether to use absolute actions (actions_abs) instead of relative actions (actions_rel)
 
