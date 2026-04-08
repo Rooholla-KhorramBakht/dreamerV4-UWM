@@ -155,7 +155,7 @@ class DreamerV4Denoiser(nn.Module):
                                     2 # noise level + shortcut tokens (obs + act) that are combined into a single control token each
         self.layer_types = [
                 LayerType.SPATIAL,
-                LayerType.SPATIAL,
+                LayerType.TEMPORAL,
                 LayerType.SPATIAL,
                 LayerType.TEMPORAL,
             ]
