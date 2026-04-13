@@ -238,15 +238,18 @@ class ShortcutUWMForwardProcess(nn.Module):
                  max_diff_steps=32,
                  action_noise_std: float = 1.,
                  mode_weights: Optional[dict] = None,
+                 flow_bias: float = 0.25,
                  device='cpu'):
         super().__init__()
         assert (max_diff_steps & (max_diff_steps - 1)) == 0, "max_diff_steps must be a power of 2"
+        assert 0.0 <= flow_bias <= 1.0, "flow_bias must lie in [0, 1]"
         self.max_diff_steps = max_diff_steps
         self.num_noise_levels = max_diff_steps
         self.max_pow2 = int(math.log2(max_diff_steps))
         self.d_min = 1.0 / float(max_diff_steps)
         self.device = device
         self.action_noise_std = action_noise_std
+        self.flow_bias = float(flow_bias)
         self.modes = ['policy', 'video', 'wm', 'id', 'forcing']
         if mode_weights is not None:
             weights = [float(mode_weights.get(m, 0.0)) for m in self.modes]
@@ -290,11 +293,24 @@ class ShortcutUWMForwardProcess(nn.Module):
         NOISY = 0                           # tau index for "fully noisy"
 
         # --- Shared shortcut step size (same for obs & act) ---
-        # step_index_raw ∈ {0, ..., max_pow2}; d_t = 1 / 2^step_index_raw
-        step_index_raw = torch.randint(
-            0, self.max_pow2 + 1, (B, 1),
-            device=self.device, dtype=torch.long,
-        )
+        # step_index_raw ∈ {0, ..., max_pow2}; d_t = 1 / 2^step_index_raw.
+        # With probability `flow_bias`, force the flow branch (step_index_raw = max_pow2,
+        # d = d_min). Remaining mass is spread uniformly over the bootstrap branches
+        # {0, ..., max_pow2 - 1}. This keeps the flow objective well-trained so the
+        # bootstrap target ladder has a solid base rung.
+        if self.max_pow2 == 0:
+            step_index_raw = torch.zeros((B, 1), device=self.device, dtype=torch.long)
+        else:
+            is_flow = torch.rand(B, 1, device=self.device) < self.flow_bias
+            bootstrap_raw = torch.randint(
+                0, self.max_pow2, (B, 1),
+                device=self.device, dtype=torch.long,
+            )
+            flow_raw = torch.full(
+                (B, 1), self.max_pow2,
+                device=self.device, dtype=torch.long,
+            )
+            step_index_raw = torch.where(is_flow, flow_raw, bootstrap_raw)
         step = 1.0 / (2.0 ** step_index_raw.float())         # (B, 1) float, d_t
         # Convention: step_index 0 ↔ d_min (smallest), max_pow2 ↔ 1 (largest)
         step_index = self.max_pow2 - step_index_raw           # (B, 1)
@@ -416,6 +432,7 @@ def compute_bootstrap_uwm_loss(
     info: dict,
     denoiser: DreamerV4Denoiser,
     device='cpu',
+    teacher: Optional[DreamerV4Denoiser] = None,
 ):
     """
     Shortcut / bootstrap loss for the unified world model (two streams: obs + act).
@@ -423,6 +440,10 @@ def compute_bootstrap_uwm_loss(
     When step_index == 0 (d = d_min):  flow loss — direct x-prediction against clean target.
     When step_index > 0 (d > d_min):   bootstrap loss — match big-step velocity to
                                         the mean of two no-grad half-step velocities.
+
+    If `teacher` is provided, the two half-step target forwards are evaluated with it
+    (typically an EMA copy of the student). If `teacher is None` the student itself is
+    used in no-grad / eval mode (self-bootstrapped target).
 
     Returns: obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss  (all scalars)
     """
@@ -466,11 +487,17 @@ def compute_bootstrap_uwm_loss(
     # =================================================
     # 1) Bootstrap target (no-grad, two half-steps)
     # =================================================
+    target_net = teacher if teacher is not None else denoiser
+    restore_student_train = False
     with torch.no_grad():
-        denoiser.eval()
+        if teacher is None:
+            # self-bootstrap: temporarily flip the student to eval for target.
+            # (kept for backward-compat; prefer passing an EMA teacher).
+            target_net.eval()
+            restore_student_train = True
 
         # --- first half-step: f(x_τ, τ, d/2) ---
-        f1_obs, f1_act = denoiser(
+        f1_obs, f1_act = target_net(
             noisy_act=a_tau_det.squeeze(-2),
             noisy_obs=x_tau_det,
             obs_sigma_idx=obs_tau_idx,
@@ -488,7 +515,7 @@ def compute_bootstrap_uwm_loss(
 
         # tau indices at τ + d/2  (already computed by forward process)
         # --- second half-step: f(z', τ+d/2, d/2) ---
-        f2_obs, f2_act = denoiser(
+        f2_obs, f2_act = target_net(
             noisy_act=a_prime.squeeze(-2),
             noisy_obs=z_prime,
             obs_sigma_idx=obs_tau_plus_half_idx,
@@ -505,14 +532,15 @@ def compute_bootstrap_uwm_loss(
         v_target_obs = 0.5 * (b1_obs + b2_obs)
         v_target_act = 0.5 * (b1_act + b2_act)
 
-    denoiser.train()
+    if restore_student_train:
+        denoiser.train()
 
     # =================================================
     # 2) Big-step prediction (gradient tracked)
     # =================================================
     z_hat, a_hat = denoiser(
         noisy_act=a_tau_det.squeeze(-2),
-        noisy_obs=x_tau_det.clone().requires_grad_(True),
+        noisy_obs=x_tau_det,
         obs_sigma_idx=obs_tau_idx,
         obs_step_idx=step_idx_bt,
         act_sigma_idx=act_tau_idx,

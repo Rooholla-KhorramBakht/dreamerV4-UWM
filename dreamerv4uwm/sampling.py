@@ -423,6 +423,150 @@ def worldmodel_dynamics_flowmatching_no_cache(
     return z[:, T_ctx:]
 
 
+@torch.no_grad()
+def unified_shortcut_sampler(
+    denoiser,
+    ctx_latents,              # (B, T_ctx, N_lat, D_lat)
+    mode='wm',                # 'policy', 'video', 'wm', 'id', 'forcing'
+    ctx_actions=None,         # (B, T_ctx, n_act) — required for policy, wm, id, forcing
+    all_actions=None,         # (B, T_ctx + num_pred_steps, n_act)
+    all_latents=None,         # (B, T_ctx + num_pred_steps, N_lat, D_lat) — required for 'id' mode
+    num_pred_steps=1,
+    num_diffusion_steps=4,    # power of two
+    context_cond_tau=127/128,
+    action_noise_std=1.0,
+):
+    """
+    Unified Euler sampler for all UWM training modes with the shortcut
+    denoiser. Behaviourally identical to `unified_flowmatching_sampler`,
+    except that `step_idx` is set to
+    `get_step_index(1/num_diffusion_steps, num_noise_levels)` instead of 0,
+    matching compute_bootstrap_uwm_loss.
+    """
+    assert mode in ('policy', 'video', 'wm', 'id', 'forcing'), \
+        f"Unknown mode '{mode}'"
+    assert (num_diffusion_steps & (num_diffusion_steps - 1)) == 0, \
+        "num_diffusion_steps must be a power of two"
+
+    device = ctx_latents.device
+    dtype  = ctx_latents.dtype
+    B, T_ctx, N_lat, D_lat = ctx_latents.shape
+    T_total = T_ctx + num_pred_steps
+
+    num_noise_levels = denoiser.cfg.denoiser.num_noise_levels
+
+    step_size = 1.0 / num_diffusion_steps
+    denoising_step_index = get_step_index(step_size, num_noise_levels)
+    step_index_tensor = torch.full(
+        (B, T_total), denoising_step_index, dtype=torch.long, device=device
+    )
+
+    tau_cond_idx = get_noise_index(context_cond_tau, num_noise_levels)
+    stride = num_noise_levels // num_diffusion_steps
+
+    # --- resolve actions tensor ---
+    if mode == 'video':
+        n_act = ctx_actions.shape[-1] if ctx_actions is not None else (
+            all_actions.shape[-1] if all_actions is not None else 1
+        )
+    elif mode == 'wm':
+        assert all_actions is not None, "wm mode requires all_actions (B, T_total, n_act)"
+        n_act = all_actions.shape[-1]
+    elif mode == 'id':
+        assert all_latents is not None, "id mode requires all_latents (B, T_total, N_lat, D_lat)"
+        if all_actions is not None:
+            n_act = all_actions.shape[-1]
+        elif ctx_actions is not None:
+            n_act = ctx_actions.shape[-1]
+        else:
+            raise ValueError("id mode requires ctx_actions or all_actions to determine n_act")
+    else:
+        assert ctx_actions is not None, f"{mode} mode requires ctx_actions"
+        n_act = ctx_actions.shape[-1]
+
+    # ---- obs init ----
+    denoise_obs = mode != 'id'
+
+    if mode == 'id':
+        assert all_latents.shape == (B, T_total, N_lat, D_lat)
+        z = all_latents.clone().to(device=device, dtype=dtype)
+        obs_clean_idx = num_noise_levels - 1
+    else:
+        z = torch.randn(B, T_total, N_lat, D_lat, device=device, dtype=dtype)
+        z_ctx = (1.0 - context_cond_tau) * torch.randn_like(ctx_latents) + context_cond_tau * ctx_latents
+        z[:, :T_ctx] = z_ctx
+
+    # ---- act init ----
+    denoise_act = mode in ('policy', 'id', 'forcing')
+
+    if mode == 'wm':
+        z_act = all_actions.to(device=device, dtype=dtype)
+        act_clean_idx = num_noise_levels - 1
+    elif mode == 'video':
+        z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+    elif mode in ('policy', 'forcing'):
+        z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+        a_ctx = (1.0 - context_cond_tau) * action_noise_std * torch.randn_like(ctx_actions) + context_cond_tau * ctx_actions.to(device=device, dtype=dtype)
+        z_act[:, :T_ctx] = a_ctx
+    elif mode == 'id':
+        z_act = action_noise_std * torch.randn(B, T_total, n_act, device=device, dtype=dtype)
+
+    # ---- Euler loop ----
+    for k in range(num_diffusion_steps):
+        tau_current_idx = k * stride
+        tau_current     = tau_current_idx / float(num_noise_levels)
+
+        if mode == 'id':
+            obs_sigma_idx = torch.full((B, T_total), obs_clean_idx, dtype=torch.long, device=device)
+        else:
+            obs_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+            obs_sigma_idx[:, :T_ctx] = tau_cond_idx
+
+        if mode == 'wm':
+            act_sigma_idx = torch.full((B, T_total), act_clean_idx, dtype=torch.long, device=device)
+        elif mode == 'video':
+            act_sigma_idx = torch.zeros((B, T_total), dtype=torch.long, device=device)
+        elif mode == 'id':
+            act_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+        else:
+            act_sigma_idx = torch.full((B, T_total), tau_current_idx, dtype=torch.long, device=device)
+            act_sigma_idx[:, :T_ctx] = tau_cond_idx
+
+        z_hat, act_hat = denoiser(
+            noisy_act    = z_act,
+            noisy_obs    = z,
+            obs_sigma_idx= obs_sigma_idx,
+            obs_step_idx = step_index_tensor,
+            act_sigma_idx= act_sigma_idx,
+            act_step_idx = step_index_tensor,
+        )
+        act_hat = act_hat.squeeze(-2)
+
+        denom = max(1.0 - tau_current, 1e-5)
+
+        if denoise_obs:
+            v_obs = (z_hat - z) / denom
+            z[:, T_ctx:] = z[:, T_ctx:] + (v_obs * step_size)[:, T_ctx:]
+
+        if denoise_act:
+            v_act = (act_hat - z_act) / denom
+            if mode == 'id':
+                z_act = z_act + v_act * step_size
+            else:
+                z_act[:, T_ctx:] = z_act[:, T_ctx:] + (v_act * step_size)[:, T_ctx:]
+
+    out_obs = z[:, T_ctx:] if denoise_obs else None
+    out_act = z_act[:, T_ctx:] if denoise_act else None
+
+    if mode == 'id':
+        out_obs = None
+    if mode in ('video', 'wm'):
+        out_act = None
+
+    return out_obs, out_act
+
+
+
 import time
 class AutoRegressiveForwardDynamics:
     def __init__(self, 

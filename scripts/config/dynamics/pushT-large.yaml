@@ -55,6 +55,9 @@ train:
     id: 1.0
     forcing: 1.0
   video_pretraining: false # Set the action to zero in doing video pretraining
+  shortcut:
+    flow_bias: 0.25   # P(step_index_raw = max_pow2) → forces flow branch. Remaining mass uniform over bootstrap rungs.
+    ema_decay: 0.999  # EMA decay for the teacher used in the bootstrap target.
 
 wandb:
   enable: true

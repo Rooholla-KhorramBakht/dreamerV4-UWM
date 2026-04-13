@@ -66,6 +66,26 @@ def build_dataloader(cfg, rank, world_size):
     return loader, sampler
 
 
+@torch.no_grad()
+def update_ema(ema_model: torch.nn.Module, student_model: torch.nn.Module, decay: float):
+    """In-place EMA update: p_ema = decay * p_ema + (1 - decay) * p_student."""
+    student_params = dict(student_model.named_parameters())
+    for name, p_ema in ema_model.named_parameters():
+        p_student = student_params[name].detach()
+        p_ema.mul_(decay).add_(p_student, alpha=1.0 - decay)
+    student_buffers = dict(student_model.named_buffers())
+    for name, b_ema in ema_model.named_buffers():
+        if name in student_buffers:
+            b_ema.copy_(student_buffers[name].detach())
+
+
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    """Strip DDP and torch.compile wrappers to reach the raw DenoiserWrapper."""
+    inner = model.module if isinstance(model, DDP) else model
+    inner = getattr(inner, "_orig_mod", inner)
+    return inner
+
+
 def build_models(cfg, device, local_rank):
     tokenizer = load_tokenizer(
         cfg, device=device, max_num_forward_steps=cfg.denoiser.max_sequence_length
@@ -80,9 +100,11 @@ def build_models(cfg, device, local_rank):
     else:
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
 
+    flow_bias = float(cfg.train.shortcut.flow_bias)
     diffuser = ShortcutUWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
         mode_weights=OmegaConf.to_container(cfg.train.mode_weights, resolve=True),
+        flow_bias=flow_bias,
         device=device,
     )
 
@@ -93,13 +115,23 @@ def build_models(cfg, device, local_rank):
     for p in tokenizer.parameters():
         p.requires_grad_(False)
 
+    # EMA teacher: same architecture, no grad, not compiled, not DDP-wrapped.
+    # Used to compute the shortcut bootstrap target — decoupling the teacher
+    # from the live student stabilises the target-recursion ladder.
+    teacher = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
+    teacher.load_state_dict(denoiser.state_dict())
+    teacher = teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
     if cfg.train.use_compile:
         denoiser = torch.compile(denoiser, mode="max-autotune-no-cudagraphs", fullgraph=True)
         tokenizer = torch.compile(tokenizer, mode="max-autotune-no-cudagraphs", fullgraph=False)
 
     denoiser = DDP(denoiser, device_ids=[local_rank], find_unused_parameters=False)
 
-    return tokenizer, denoiser, diffuser
+    return tokenizer, denoiser, teacher, diffuser
 
 
 def setup_logging(cfg, rank, log_dir, wandb_run_id):
@@ -149,6 +181,7 @@ def train_epoch(
     train_sampler,
     tokenizer,
     denoiser,
+    teacher,
     diffuser,
     optim,
     scheduler,
@@ -160,6 +193,7 @@ def train_epoch(
     log_dir,
     wandb_run_id,
 ):
+    ema_decay = float(cfg.train.shortcut.ema_decay)
     denoiser.train()
     train_sampler.set_epoch(epoch)
 
@@ -204,7 +238,9 @@ def train_epoch(
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             diffused_info = diffuser(z_clean, actions)
             obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss = (
-                compute_bootstrap_uwm_loss(diffused_info, denoiser, device=device)
+                compute_bootstrap_uwm_loss(
+                    diffused_info, denoiser, device=device, teacher=teacher,
+                )
             )
             loss_micro = (
                 obs_flow_loss + act_flow_loss + obs_boot_loss + act_boot_loss
@@ -223,6 +259,7 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(denoiser.parameters(), max_norm=1.0)
             optim.step()
             scheduler.step()
+            update_ema(teacher, _unwrap(denoiser), ema_decay)
             global_update += 1
 
             total_tensor = torch.tensor([accum_total], device=device)
@@ -322,7 +359,7 @@ def main(cfg: DictConfig):
     # --- Models ---
     if rank == 0:
         print("Building models...")
-    tokenizer, denoiser, diffuser = build_models(cfg, device, local_rank)
+    tokenizer, denoiser, teacher, diffuser = build_models(cfg, device, local_rank)
     if rank == 0:
         n_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
         print(f"Denoiser learnable parameters: {n_params:,}")
@@ -352,6 +389,10 @@ def main(cfg: DictConfig):
             scheduler=scheduler,
             rank=rank,
         )
+        # Re-sync EMA teacher to the freshly-loaded student params. The
+        # teacher state is not persisted in the checkpoint; it warms up
+        # again over a few thousand optimizer steps after resume.
+        teacher.load_state_dict(_unwrap(denoiser).state_dict())
     elif rank == 0:
         print("Starting from scratch.")
 
@@ -384,6 +425,7 @@ def main(cfg: DictConfig):
             train_sampler=train_sampler,
             tokenizer=tokenizer,
             denoiser=denoiser,
+            teacher=teacher,
             diffuser=diffuser,
             optim=optim,
             scheduler=scheduler,
