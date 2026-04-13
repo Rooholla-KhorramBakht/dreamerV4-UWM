@@ -30,6 +30,7 @@ denoiser:
   n_actions: 2
   is_causal: false
   latent_attends_action: false
+  layer_types: [spatial, temporal, spatial, temporal]
 
 train:
   device: 'cuda:0'

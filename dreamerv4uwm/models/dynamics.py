@@ -125,6 +125,7 @@ class DreamerV4DenoiserCfg:
     dual_stream: bool = False
     is_causal: bool = False  # whether to use causal masking in the transformer (should be False for standard denoising, True for stepwise inference)
     latent_attends_action: bool = False  # whether latent (Z) tokens can directly attend to action (A, AC) tokens
+    layer_types: Optional[List[str]] = None  # list of layer types, e.g. ["spatial", "temporal", "spatial", "temporal"]; defaults to alternating spatial/temporal
 
 class DreamerV4Denoiser(nn.Module):
     """
@@ -153,11 +154,12 @@ class DreamerV4Denoiser(nn.Module):
                                    cfg.num_latent_tokens + \
                                    cfg.num_register_tokens + \
                                     2 # noise level + shortcut tokens (obs + act) that are combined into a single control token each
-        self.layer_types = [
-                LayerType.SPATIAL,
-                LayerType.SPATIAL,
-                LayerType.SPATIAL,
-                LayerType.TEMPORAL,
+        if cfg.layer_types is not None:
+            self.layer_types = [LayerType(t) for t in cfg.layer_types]
+        else:
+            self.layer_types = [
+                LayerType.SPATIAL if i % 2 == 0 else LayerType.TEMPORAL
+                for i in range(4)
             ]
         # --- Transformer layers ---
         self.layers = nn.ModuleList([
