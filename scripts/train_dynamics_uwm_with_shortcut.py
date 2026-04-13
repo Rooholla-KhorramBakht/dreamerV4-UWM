@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from dreamerv4uwm.datasets import create_distributed_dataloader
-from dreamerv4uwm.loss import FlowMatchingForwardProcess, compute_flowmatching_loss
+from dreamerv4uwm.loss import ShortcutUWMForwardProcess, compute_bootstrap_uwm_loss
 from dreamerv4uwm.models.dynamics import DenoiserWrapper
 from dreamerv4uwm.models.utils import load_denoiser, load_tokenizer
 from dreamerv4uwm.utils.distributed import (
@@ -23,10 +23,6 @@ from dreamerv4uwm.utils.distributed import (
     setup_distributed,
 )
 
-
-# Probability of using a random context length instead of full sequence.
-# When triggered, context length is sampled uniformly from [1, T//2].
-CONTEXT_PROB = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +61,7 @@ def build_dataloader(cfg, rank, world_size):
         split_seed=cfg.dataset.split_seed,
         shuffle=True,
         drop_last=True,
+        absolute_actions=cfg.train.absolute_actions,
     )
     return loader, sampler
 
@@ -83,8 +80,9 @@ def build_models(cfg, device, local_rank):
     else:
         denoiser = DenoiserWrapper(cfg, max_num_forward_steps=cfg.denoiser.max_sequence_length)
 
-    diffuser = FlowMatchingForwardProcess(
+    diffuser = ShortcutUWMForwardProcess(
         max_diff_steps=cfg.denoiser.num_noise_levels,
+        mode_weights=OmegaConf.to_container(cfg.train.mode_weights, resolve=True),
         device=device,
     )
 
@@ -123,7 +121,7 @@ def setup_logging(cfg, rank, log_dir, wandb_run_id):
             wandb.init(
                 project=cfg.wandb.project,
                 id=wandb_run_id,
-                resume="must",
+                resume="allow",
                 config=OmegaConf.to_container(cfg, resolve=True),
                 sync_tensorboard=True,
                 dir=log_dir,
@@ -173,6 +171,8 @@ def train_epoch(
 
     accum_obs_flow = 0.0
     accum_act_flow = 0.0
+    accum_obs_boot = 0.0
+    accum_act_boot = 0.0
     accum_total = 0.0
 
     data_start = time.perf_counter()
@@ -185,14 +185,7 @@ def train_epoch(
 
         # --- Prepare batch ---
         images = batch["image"].to(device, non_blocking=True)  # (B, T, C, H, W)
-        if not cfg.train.video_pretraining:
-            actions = batch["action"].to(device, non_blocking=True)  # (B, T, action_dim)
-        else:
-            actions = torch.zeros(
-                images.shape[0], images.shape[1], cfg.denoiser.n_actions,
-                device=images.device, dtype=images.dtype,
-            )
-
+        actions = batch["action"].to(device, non_blocking=True)  # (B, T, action_dim)
         images = images.to(torch.bfloat16)
         # Slice to configured action dims and add token dimension: (B, T, A) -> (B, T, 1, A)
         actions = actions.to(torch.bfloat16)[:, :, :cfg.denoiser.n_actions].unsqueeze(-2)
@@ -208,26 +201,21 @@ def train_epoch(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 z_clean = tokenizer.encode(images).detach().clone()
 
-        T = z_clean.shape[1]
-        context_length = (
-            torch.randint(1, max(2, T // 2), (1,)).item()
-            if torch.rand(1).item() < CONTEXT_PROB
-            else None
-        )
-
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            diffused_info = diffuser(z_clean, actions, context_length=context_length)
-            obs_flow_loss, act_flow_loss = compute_flowmatching_loss(
-                diffused_info, denoiser, device=device
+            diffused_info = diffuser(z_clean, actions)
+            obs_flow_loss, act_flow_loss, obs_boot_loss, act_boot_loss = (
+                compute_bootstrap_uwm_loss(diffused_info, denoiser, device=device)
             )
             loss_micro = (
-                obs_flow_loss + act_flow_loss
+                obs_flow_loss + act_flow_loss + obs_boot_loss + act_boot_loss
             ) / cfg.train.accum_grad_steps
 
         loss_micro.backward()
 
-        accum_obs_flow += obs_flow_loss.mean().item()
-        accum_act_flow += act_flow_loss.mean().item()
+        accum_obs_flow += obs_flow_loss.item()
+        accum_act_flow += act_flow_loss.item()
+        accum_obs_boot += obs_boot_loss.item()
+        accum_act_boot += act_boot_loss.item()
         accum_total += loss_micro.item()
 
         # --- Optimizer step at end of accumulation window ---
@@ -248,14 +236,18 @@ def train_epoch(
                 tb_writer.add_scalar("train/total_loss", sync_loss, global_update)
                 tb_writer.add_scalar("train/obs_flow_loss", accum_obs_flow, global_update)
                 tb_writer.add_scalar("train/act_flow_loss", accum_act_flow, global_update)
+                tb_writer.add_scalar("train/obs_boot_loss", accum_obs_boot, global_update)
+                tb_writer.add_scalar("train/act_boot_loss", accum_act_boot, global_update)
                 tb_writer.add_scalar("train/lr", lr, global_update)
 
                 if global_update % cfg.print_every == 0:
                     print(
                         f"  [step {global_update}]"
                         f"  loss: {sync_loss:.4f}"
-                        f"  obs: {accum_obs_flow:.4f}"
-                        f"  act: {accum_act_flow:.4f}"
+                        f"  obs_f: {accum_obs_flow:.4f}"
+                        f"  act_f: {accum_act_flow:.4f}"
+                        f"  obs_b: {accum_obs_boot:.4f}"
+                        f"  act_b: {accum_act_boot:.4f}"
                         f"  lr: {lr:.2e}"
                     )
 
@@ -275,6 +267,8 @@ def train_epoch(
 
             accum_obs_flow = 0.0
             accum_act_flow = 0.0
+            accum_obs_boot = 0.0
+            accum_act_boot = 0.0
             accum_total = 0.0
 
         torch.cuda.synchronize(device)
