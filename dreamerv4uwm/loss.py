@@ -271,7 +271,17 @@ class UWMForwardProcess(nn.Module):
         action_tau_idx = (action_tau*self.max_diff_steps).to(torch.long)
         obs_diff = dict(tau=state_tau, tau_idx = state_tau_idx.to(self.device))
         act_diff = dict(tau=action_tau, tau_idx = action_tau_idx.to(self.device))
-        return obs_diff, act_diff, context_length, mode
+        # Frame-identity flag for the horizon-aware temporal mask.
+        # WM stays fully causal (ctx + hor both treated as context).
+        # video is deprecated and kept fully causal for parity with the legacy path.
+        # All other modes split at `context_length`: hor = bidirectional within
+        # the horizon block, ctx = causal-only-attended-from. forcing's
+        # context_length is forced to 1 inside the mode's branch above, so its
+        # is_horizon labels frame 0 as ctx and 1..T-1 as hor.
+        is_horizon = torch.zeros(T, dtype=torch.long, device=self.device)
+        if mode in ('policy', 'forcing', 'id', 'action_only'):
+            is_horizon[context_length:] = 1
+        return obs_diff, act_diff, context_length, mode, is_horizon
 
     def forward(
         self,
@@ -281,10 +291,10 @@ class UWMForwardProcess(nn.Module):
     ):
         B, T, N_lat, D_lat = z_clean.shape
         device = z_clean.device
-        obs_diff, act_diff, context_length, mode = self.sample_step_noise(
+        obs_diff, act_diff, context_length, mode, is_horizon = self.sample_step_noise(
             B, T, force_mode=force_mode,
         )
-        
+
         # observation forward diffusion
         z0 = torch.randn_like(z_clean)
         obs_tau = obs_diff["tau"].unsqueeze(-1).unsqueeze(-1)  # (B,T,1,1)
@@ -310,6 +320,7 @@ class UWMForwardProcess(nn.Module):
             "act_tau_idx": act_diff["tau_idx"],
             "context_length": context_length,
             "mode": mode,
+            "is_horizon": is_horizon,
             "forcing_mask_actions": self.forcing_mask_actions if mode == 'forcing' else False,
         }
     
@@ -352,6 +363,7 @@ def compute_uwm_loss(
         obs_step_idx=step_idx,
         act_sigma_idx=act_tau_idx,
         act_step_idx=step_idx,
+        is_horizon=info.get("is_horizon"),
     )  # a_hat: (B,T,1,A); pred_rewards: (B,T,L,K) or None
 
     # X-prediction targets: directly regress clean signal

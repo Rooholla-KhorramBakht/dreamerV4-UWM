@@ -2,8 +2,7 @@
 defaults:
  - /tokenizer: /pushT
 
-dual_stream: false
-dynamics_ckpt: null 
+dynamics_ckpt: null
 reload_checkpoint: null
 output_dir: checkpoints/dynamics/${now:%Y-%m-%d_%H-%M-%S}
 plot_every: 1000
@@ -54,7 +53,9 @@ train:
   lr: 1e-4
   num_workers: 12
   lpips_weight: 0.2
-  num_training_steps: 1e7
+
+  warmup_samples: 4200 # ~1.5 hours with the current settings
+  total_samples: 420000 # ~150 hours with the current settings; adjust as needed for longer/shorter training
   mixed_precision: false
   enable_fast_matmul: true
   clip_grad_norm: 1.0

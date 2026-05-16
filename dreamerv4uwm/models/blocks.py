@@ -32,6 +32,43 @@ def create_temporal_mask(T: int, device: str = "cpu") -> torch.Tensor:
     mask = arange.view(T, 1) >= arange.view(1, T)  # (q >= k)
     return mask  # dtype=bool, shape (T, T)
 
+
+def create_horizon_aware_temporal_mask(
+    T: int,
+    is_horizon: Optional[torch.Tensor] = None,
+    attention_window: Optional[int] = None,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """Causal-by-default mask with bidirectional attention inside a horizon block.
+
+    Polarity (SDPA bool convention): True = allowed, False = masked.
+
+    Rules:
+      base    :  k <= q                                            (causal)
+      window  :  AND (q - k) < attention_window                    (rolling, optional)
+      horizon :  OR (is_horizon[q] AND is_horizon[k])              (bidir within hor)
+                 — also clamped to ±attention_window when given.
+
+    is_horizon: (T,) bool/long — frame-identity flag (1 = horizon, 0 = context).
+    attention_window: optional rolling window; when None, no window clamp.
+
+    When is_horizon is None or all-zeros, behavior is identical to
+    `create_temporal_window_mask` (with attention_window) or the standard
+    causal lower-triangular mask (without).
+    """
+    q = torch.arange(T, device=device).view(T, 1)
+    k = torch.arange(T, device=device).view(1, T)
+    causal_ok = (k <= q)
+    if attention_window is not None:
+        causal_ok = causal_ok & ((q - k) < attention_window)
+    if is_horizon is not None:
+        ih = is_horizon.to(device=device, dtype=torch.bool)
+        bidir_ok = ih.view(T, 1) & ih.view(1, T)
+        if attention_window is not None:
+            bidir_ok = bidir_ok & ((q - k).abs() < attention_window)
+        return causal_ok | bidir_ok
+    return causal_ok
+
 def create_encoder_spatial_mask(N_patch, N_latent, device="cpu"):
     S = N_patch + N_latent
     mask = torch.zeros(S, S, dtype=torch.bool, device=device)
@@ -473,12 +510,13 @@ class EfficientTransformerLayer(nn.Module):
         self.ffn = FeedForwardSwiGLU(model_dim, None, dropout_prob)
         self.dropout = nn.Dropout(dropout_prob)
 
-    def forward(self, 
-                x, 
+    def forward(self,
+                x,
                 spatial_mask=None,
                 kv_cache: Optional[KVCache] = None,
                 update_cache: bool = True,
-                position_ids: Optional[torch.Tensor] = None):
+                position_ids: Optional[torch.Tensor] = None,
+                is_horizon: Optional[torch.Tensor] = None):
         """
         compute one transformer layer block as:
         x = drop_out(Attn(RMSNorm(x))) + x
@@ -487,6 +525,11 @@ class EfficientTransformerLayer(nn.Module):
             x: (B, T, S, D) input tensor
             spatial_mask: (S, S) or broadcastable mask for spatial attention
             layer_cache: optional KVCache for caching in temporal attention
+            is_horizon: (T,) bool/long — per-frame flag (1 = horizon, 0 = context).
+                When provided in the uncached temporal path, attention becomes
+                causal between context frames and bidirectional within the
+                horizon block. Ignored in spatial layers and in the cached
+                forward_step path. None = unchanged causal behavior.
         Returns:
             x: (B, T, S, D) output tensor
         """
@@ -494,13 +537,26 @@ class EfficientTransformerLayer(nn.Module):
         h = self.norm1(x)
         if self.layer_type == LayerType.TEMPORAL:
             T = h.shape[1]
-            if (kv_cache is None) and (self.context_length is not None) and (self.context_length < T) and self.is_causal:
-                temporal_mask = create_temporal_window_mask(
+            uncached = kv_cache is None
+            window_active = (
+                uncached
+                and self.context_length is not None
+                and self.context_length < T
+                and self.is_causal
+            )
+            horizon_active = (
+                uncached
+                and is_horizon is not None
+                and self.is_causal
+            )
+            if window_active or horizon_active:
+                attn_window = self.context_length if window_active else None
+                temporal_mask = create_horizon_aware_temporal_mask(
                     T=T,
-                    context_length=self.context_length,
+                    is_horizon=is_horizon if horizon_active else None,
+                    attention_window=attn_window,
                     device=h.device,
                 )
-                # Todo: incorporate the is_causal in making the proper mask. right now the mask is always causal
                 h = self.attn(
                     h, h, h, dim=1,
                     mask=temporal_mask,   # True=allowed
@@ -598,10 +654,10 @@ class EfficientTransformerBlock(nn.Module):
                     )
                 )
 
-    def forward(self, x, spatial_mask=None):
+    def forward(self, x, spatial_mask=None, is_horizon: Optional[torch.Tensor] = None):
         assert x.size(-1) == self.model_dim
         for i, layer in enumerate(self.layers):
-            x = layer(x, spatial_mask=spatial_mask)
+            x = layer(x, spatial_mask=spatial_mask, is_horizon=is_horizon)
         return x
     
     def forward_step(self, 

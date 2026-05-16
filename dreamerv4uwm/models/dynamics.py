@@ -248,6 +248,12 @@ class DreamerV4Denoiser(nn.Module):
         self.obs_shortcut_embedder = DiscreteEmbedder(int(math.log2(cfg.num_noise_levels)) + 1, cfg.model_dim)  # step index: 0..max_pow2
         self.act_diffusion_embedder = DiscreteEmbedder(cfg.num_noise_levels, cfg.model_dim)  # τ index: 0..num_noise_levels-1
         self.act_shortcut_embedder = DiscreteEmbedder(int(math.log2(cfg.num_noise_levels)) + 1, cfg.model_dim)  # step index: 0..max_pow2
+        # Frame-identity embedder: 0 = context frame, 1 = horizon frame. Summed
+        # into IC and AC after their projections. Zero-init keeps the network
+        # bit-equivalent to the pre-existing arch when is_horizon is None or
+        # all-zeros (i.e., WM mode and any caller that doesn't supply it).
+        self.frame_id_embedder = DiscreteEmbedder(2, cfg.model_dim)
+        nn.init.zeros_(self.frame_id_embedder.embeddings)
         
         # --- Register tokens: (1, 1, S_r, D) ---
         self.register_tokens = nn.Parameter(
@@ -328,6 +334,7 @@ class DreamerV4Denoiser(nn.Module):
         obs_step_idx: torch.Tensor,        # (B, T) long, step index (0..max_pow2; 0 ↔ d_min)
         act_sigma_idx: torch.Tensor,  # (B, T) long, τ index for actions (if separate from obs)
         act_step_idx: torch.Tensor,   # (B, T) long, step index for actions (if separate from obs
+        is_horizon: Optional[torch.Tensor] = None,  # (T,) long {0,1}; None ↔ all context (purely causal)
 
 
     ) -> torch.Tensor:
@@ -337,7 +344,7 @@ class DreamerV4Denoiser(nn.Module):
         # diff_step_token: (B, T, 1, D_model)
         obs_diff_step_token = self.obs_diffusion_embedder(obs_sigma_idx).unsqueeze(-2)
         obs_shortcut_token = self.obs_shortcut_embedder(obs_step_idx).unsqueeze(-2)
-        act_diff_step_token = self.act_diffusion_embedder(act_sigma_idx).unsqueeze(-2) 
+        act_diff_step_token = self.act_diffusion_embedder(act_sigma_idx).unsqueeze(-2)
         act_shortcut_token = self.act_shortcut_embedder(act_step_idx).unsqueeze(-2)
 
         # concat along channels: (B, T, 1, 2*D_model) -> (B, T, 1, D_model)
@@ -345,7 +352,16 @@ class DreamerV4Denoiser(nn.Module):
         obs_diff_control_token = self.obs_diff_control_proj(obs_diff_control_token)  # (B, T, 1, D_model)
         act_diff_control_token = torch.cat([act_shortcut_token, act_diff_step_token], dim=-1)
         act_diff_control_token = self.act_diff_control_proj(act_diff_control_token)  # (B, T, 1, D_model)
-        
+
+        # --- Frame-identity embedding summed into IC and AC ---
+        # is_horizon is per-frame and shared across the batch. Zero-init means
+        # the no-arg path is bit-equivalent to the pre-existing model.
+        if is_horizon is not None:
+            frame_id_emb = self.frame_id_embedder(is_horizon)        # (T, D)
+            frame_id_token = frame_id_emb.view(1, T, 1, self.cfg.model_dim)
+            obs_diff_control_token = obs_diff_control_token + frame_id_token
+            act_diff_control_token = act_diff_control_token + frame_id_token
+
         # --- Register tokens replicated per time step ---
         # reg_tokens: (1, 1, S_r, D) -> (B, T, S_r, D)
         reg_tokens = self.register_tokens.expand(B, T, -1, -1)
@@ -385,7 +401,7 @@ class DreamerV4Denoiser(nn.Module):
         else:
             spatial_mask = None
         for layer in self.layers:
-            x = layer(x, spatial_mask=spatial_mask)
+            x = layer(x, spatial_mask=spatial_mask, is_horizon=is_horizon)
 
         # --- Project back to latent dim, return only latent slice ---
         if self.cfg.train_reward_model:
@@ -399,7 +415,7 @@ class DreamerV4Denoiser(nn.Module):
             obs_output = self.obs_projector(x[:, :, :self.cfg.num_latent_tokens, :])  # (B, T, N_lat, D_latent)
             act_output = self.action_projector(x[:, :, -self.cfg.num_action_tokens:, :])  # (B, T, S_a, n_actions)
             return obs_output, act_output, None
-    
+
     def forward_step(
         self,
         noisy_act: torch.Tensor,           # (B, T, n_actions)
@@ -410,11 +426,18 @@ class DreamerV4Denoiser(nn.Module):
         act_step_idx: torch.Tensor,        # (B, T) long
         start_step_idx: int,
         update_cache: bool = True,
+        is_horizon: Optional[torch.Tensor] = None,
     ):
         """KV-cached counterpart to `forward()` for autoregressive sampling.
 
         Token layout, projections, and outputs mirror `forward()` exactly; only
         the temporal layers are run via their cached `forward_step` path.
+
+        `is_horizon` is summed into IC/AC for distributional consistency with
+        training, but the cached temporal path remains purely causal — the
+        horizon-aware mask is uncached-only. At deployment the streamed
+        context should pass is_horizon = zeros (or None, equivalent at init
+        but trained-row-0 thereafter — pass zeros for fidelity).
         """
         B, T, N_lat, D_latent = noisy_obs.shape
 
@@ -427,6 +450,12 @@ class DreamerV4Denoiser(nn.Module):
         obs_diff_control_token = self.obs_diff_control_proj(obs_diff_control_token)
         act_diff_control_token = torch.cat([act_shortcut_token, act_diff_step_token], dim=-1)
         act_diff_control_token = self.act_diff_control_proj(act_diff_control_token)
+
+        if is_horizon is not None:
+            frame_id_emb = self.frame_id_embedder(is_horizon)        # (T, D)
+            frame_id_token = frame_id_emb.view(1, T, 1, self.cfg.model_dim)
+            obs_diff_control_token = obs_diff_control_token + frame_id_token
+            act_diff_control_token = act_diff_control_token + frame_id_token
 
         reg_tokens = self.register_tokens.expand(B, T, -1, -1)
         obs_tokens = self.latent_projector(noisy_obs)
@@ -484,6 +513,7 @@ class DenoiserWrapper(nn.Module):
         obs_step_idx: torch.Tensor,       # (B, T) long
         act_sigma_idx: torch.Tensor,      # (B, T) long
         act_step_idx: torch.Tensor,       # (B, T) long
+        is_horizon: Optional[torch.Tensor] = None,
     ):
         return self.model(
             noisy_act=noisy_act,
@@ -492,6 +522,7 @@ class DenoiserWrapper(nn.Module):
             obs_step_idx=obs_step_idx,
             act_sigma_idx=act_sigma_idx,
             act_step_idx=act_step_idx,
+            is_horizon=is_horizon,
         )
 
     def forward_step(
@@ -504,6 +535,7 @@ class DenoiserWrapper(nn.Module):
         act_step_idx: torch.Tensor,       # (B, T) or (B, 1)
         start_step_idx: int,
         update_cache: bool = True,
+        is_horizon: Optional[torch.Tensor] = None,
     ):
         return self.model.forward_step(
             noisy_act=noisy_act,
@@ -514,6 +546,7 @@ class DenoiserWrapper(nn.Module):
             act_step_idx=act_step_idx,
             start_step_idx=start_step_idx,
             update_cache=update_cache,
+            is_horizon=is_horizon,
         )
 
     def init_cache(
